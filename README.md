@@ -4,7 +4,7 @@ A **Moeda Bruno (BRN)** é uma implementação experimental de um ecossistema de
 
 ---
 
-## 🚀 Funcionalidades e Diferenciais Acadêmicos
+## 🚀 Funcionalidades
 
 *   **Consenso de Maior Cadeia (*Longest Chain Rule*):** Algoritmo de resolução de consenso que substitui atomicamente a cadeia local se um par remoto apresentar uma blockchain estritamente mais longa e válida.
 *   **Gênese Determinístico (Cadeia Única):** O bloco 0 tem timestamp, nonce e hash fixos (`GENESIS_HASH`), então **todo computador cria exatamente a mesma gênese** e todos compartilham **uma única blockchain**. Nós com gênese diferente (cadeias antigas/divergentes) são recusados na sincronização.
