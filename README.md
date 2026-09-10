@@ -1,3 +1,44 @@
+1. Localmente (na sua própria máquina)
+Abra o navegador em:
+
+text
+http://localhost:8080
+ou
+
+text
+http://127.0.0.1:8080
+Importante: o explorer.py é um processo separado. O main.py sobe o nó BRN (porta 6001) e o túnel Ngrok (porta 8080), mas não sobe o explorer. Você precisa rodar o explorer em outra janela do CMD, com o venv ativo:
+
+cmd
+cd "C:\Users\adnac\Desktop\bruno crypto\agora-brn"
+env\Scripts\activate
+python explorer.py
+Saída esperada:
+
+text
+* Running on http://127.0.0.1:8080
+Deixe essa janela aberta. Em outra janela, rode o main.py 6001. Aí o explorador aparece no navegador.
+
+Se o explorer.py não estiver na pasta, é porque não foi baixado. Verifique com:
+
+cmd
+dir explorer.py
+Se não achar, baixe do repositório original:
+
+cmd
+curl -L -o explorer.py https://raw.githubusercontent.com/brunoldo2312/brnfinal/main/explorer.py
+(se o caminho não funcionar, abra o repositório no GitHub, clique em explorer.py → Raw → salve com Ctrl+S em explorer.py.)
+
+2. Pelo painel do Ngrok (mostra a URL pública)
+Enquanto o main.py estiver rodando, abra:
+
+text
+http://127.0.0.1:4040
+Esse é o painel local do Ngrok. Ele mostra uma URL do tipo:
+
+text
+https://abcd-1234.ngrok-free.app
+
 🖥️ Opção 1: Prompt de Comando (CMD)
 
 No CMD, a sintaxe VAR=valor do Linux não funciona. Usamos set e && para encadear os comandos. Copie e cole:
