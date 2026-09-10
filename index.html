@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <title>Bruno Wallet GUI Advanced</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #1e1e2e; color: #cdd6f4; padding: 20px; margin: 0; }
+        .container { max-width: 700px; margin: auto; background: #313244; padding: 25px; border-radius: 12px; }
+        h1 { color: #f5c2e7; text-align: center; margin-top: 0; }
+        .card { background: #45475a; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 5px solid #a6e3a1; }
+        .card.transfer { border-left-color: #f9e2af; }
+        .card.wallet-io { border-left-color: #89b4fa; }
+        .card.network-io { border-left-color: #f5e0dc; }
+        button { background: #89b4fa; color: #11111b; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; width: 100%; font-size: 14px; margin-bottom: 5px; }
+        button:hover { background: #b4befe; }
+        button.active-mining { background: #f38ba8; color: #11111b; }
+        button.copy-button { width: auto; padding: 7px 10px; margin-top: 6px; background: #a6e3a1; font-size: 12px; }
+        input { width: 96%; padding: 10px; background: #1e1e2e; border: 1px solid #585b70; border-radius: 6px; color: #cdd6f4; margin-bottom: 10px; font-family: monospace; }
+        .key-box { background: #181825; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 11px; word-break: break-all; margin-top: 5px; color: #fab387; }
+        .log-box { background: #11111b; padding: 12px; border-radius: 6px; font-family: monospace; max-height: 180px; overflow-y: auto; font-size: 12px; color: #a6e3a1; line-height: 1.5; }
+        .balance-txt { font-weight: bold; color: #a6e3a1; font-size: 16px; margin-top: 5px; }
+        .card.statement { border-left-color: #94e2d5; }
+        .card.mempool { border-left-color: #fab387; }
+        .mempool-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 4px; border-bottom: 1px solid #585b70; font-size: 12px; font-family: monospace; }
+        .mempool-row:last-child { border-bottom: none; }
+        .mempool-empty { color: #7f849c; font-style: italic; padding: 6px 2px; font-size: 12px; }
+        .balance-pending { color: #f9e2af; font-size: 13px; margin-top: 4px; }
+        .tx-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 8px 4px; border-bottom: 1px solid #585b70; font-size: 13px; }
+        .tx-row:last-child { border-bottom: none; }
+        .tx-in { color: #a6e3a1; }
+        .tx-out { color: #f38ba8; }
+        .tx-meta { color: #bac2de; font-size: 11px; font-family: monospace; margin-top: 2px; }
+        .tx-summary { font-size: 12px; margin-bottom: 8px; color: #cdd6f4; }
+        .badge { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 10px; background: #585b70; color: #cdd6f4; white-space: nowrap; }
+        .badge.pending { background: #f9e2af; color: #11111b; }
+        .peer-chip { display: inline-block; background: #181825; border: 1px solid #585b70; border-radius: 12px; padding: 2px 8px; margin: 2px; font-family: monospace; font-size: 11px; color: #89b4fa; }
+        .empty { color: #7f849c; font-style: italic; padding: 6px 2px; font-size: 12px; }
+        .statement-scroll { max-height: 320px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💼 Carteira Avançada Bruno</h1>
+        
+        <div class="card network-io">
+            <h3>🌐 Rede Descentralizada (P2P Sync)</h3>
+            <p>Seu endereço local de escuta: <span id="p2p-local-info" style="color: #fab387; font-family: monospace;">Carregando...</span></p>
+            <div id="p2p-lan-info" style="margin-bottom:8px;"></div>
+            <p style="margin:6px 0;">Cadeia: <span id="chain-status" style="font-family:monospace;">verificando…</span></p>
+            <p style="margin:6px 0;">Pares conectados: <b id="peer-count" style="color:#a6e3a1;">0</b></p>
+            <div id="peer-list" style="margin-bottom:10px;"></div>
+            <label>Conectar ao IP do Nó Remoto (o OUTRO computador):</label>
+            <input type="text" id="peer-ip" value="" placeholder="Ex: 192.168.0.20 (IP de rede do outro micro, não 127.0.0.1)">
+            <label>Porta do Nó Remoto:</label>
+            <input type="number" id="peer-port" placeholder="Ex: 6001">
+            <button style="background:#f5e0dc; color: #11111b;" onclick="conectarEEnviarBlocos()">Conectar e Sincronizar Cadeia</button>
+        </div>
+
+        <div class="card">
+            <h3>🔑 Endereçamento ECDSA e Chaves Ativas</h3>
+            <button onclick="gerarNovaCarteira()">Criar Nova Carteira (ECDSA)</button>
+            <div id="resultado-carteira" style="display:none; margin-top:10px;">
+                <p><strong>Seu Endereço Público:</strong> <div id="addr" class="key-box"></div>
+                <button id="btn-copiar-endereco" class="copy-button" onclick="copiarEnderecoRecebimento()">📋 Copiar endereço de recebimento</button></p>
+                <p><strong>Sua Chave Privada:</strong> <div id="s_key" class="key-box"></div></p>
+                <p><strong>Sua Chave Pública:</strong> <div id="p_key" class="key-box"></div></p>
+                <p><strong>Saldo no Livro-Razão:</strong> <div id="saldo-atual" class="balance-txt">0.00 BRN</div></p>
+                <div id="saldo-pendente" class="balance-pending" style="display:none;"></div>
+            </div>
+        </div>
+
+        <div class="card wallet-io">
+            <h3>💾 Persistência (.wallet Criptografado)</h3>
+            <label>Nome do Arquivo:</label>
+            <input type="text" id="wallet-filename" placeholder="Ex: minha_carteira">
+            <label>Senha de Criptografia:</label>
+            <input type="password" id="wallet-password" placeholder="Digite uma senha forte...">
+            <button style="background:#b4befe;" onclick="salvarCarteiraFisica()">Exportar e Criptografar Backup</button>
+            <button style="background:#cba6f7;" onclick="carregarCarteiraFisica()">Importar e Descriptografar</button>
+        </div>
+
+        <div class="card transfer">
+            <h3>💸 Transferência com Assinatura Digital</h3>
+            <label>Endereço de Origem (Remetente):</label>
+            <input type="text" id="tx-sender" placeholder="Cole seu brn1...">
+            <label>Endereço de Destino (Destinatário):</label>
+            <input type="text" id="tx-receiver" placeholder="brn1...">
+            <label>Quantia a Enviar:</label>
+            <input type="number" id="tx-amount" step="any" placeholder="0.00">
+            <button style="background:#f9e2af; color:#11111b;" onclick="transferirMoedas()">Assinar e Enviar Transação</button>
+        </div>
+
+        <div class="card">
+            <h3>⛏️ Mineração Contínua em Background</h3>
+            <button id="btn-mineracao" style="background:#a6e3a1; color:#11111b;" onclick="alternarMineracao()">Iniciar Mineração Contínua</button>
+        </div>
+
+        <div class="card mempool">
+            <h3>🕒 Mempool — Transações Pendentes (<span id="mempool-count">0</span>)</h3>
+            <div id="mempool-lista">
+                <span class="mempool-empty">Nenhuma transação pendente.</span>
+            </div>
+        </div>
+
+        <div class="card statement">
+            <h3>📜 Extrato da Carteira (Envios e Recebimentos)</h3>
+            <div id="extrato-resumo" class="tx-summary">—</div>
+            <div id="extrato-lista" class="statement-scroll">
+                <span class="empty">Crie ou importe uma carteira para ver o extrato.</span>
+            </div>
+        </div>
+
+        <h3>🗒️ Estado Atual da Blockchain</h3>
+        <div id="logs" class="log-box">Carregando livro-razão...</div>
+    </div>
+
+    <script>
+        let isMiningActive = false;
+
+        function atualizarTela() {
+            window.pywebview.api.get_full_chain().then(function(data) {
+                const logs = document.getElementById('logs');
+                logs.innerHTML = `<b>Comprimento:</b> ${data.length} blocos | <b>Mempool:</b> ${data.mempool_size} | <b>Dificuldade Atual:</b> ${data.current_difficulty}<br><br>`;
+                data.chain.slice().reverse().forEach(function(b) {
+                    logs.innerHTML += `<b>[Bloco #${b.index}]</b> Hash: ${b.hash.substring(0,22)}... (Diff: ${b.difficulty})<br>`;
+                    b.transactions.forEach(function(tx) {
+                        logs.innerHTML += ` &nbsp;&nbsp;&rarr; Envio: ${tx.amount} BRN (${tx.sender.substring(0,10)}... para ${tx.receiver.substring(0,10)}...)<br>`;
+                    });
+                });
+                
+                isMiningActive = data.is_mining;
+                const btn = document.getElementById('btn-mineracao');
+                if (isMiningActive) {
+                    btn.innerText = "⏹️ Parar Mineração Contínua";
+                    btn.className = "active-mining";
+                } else {
+                    btn.innerText = "⛏️ Iniciar Mineração Contínua";
+                    btn.className = "";
+                }
+
+                atualizarMempool(data.mempool || []);
+
+                const chainStatus = document.getElementById('chain-status');
+                if (chainStatus) {
+                    if (data.genesis_ok) {
+                        chainStatus.innerHTML = `<span style="color:#a6e3a1;">🟢 cadeia única compartilhada</span> <span style="color:#7f849c;">gênese ${(data.genesis_hash||'').substring(0,16)}…</span>`;
+                    } else {
+                        chainStatus.innerHTML = `<span style="color:#f38ba8;">🔴 cadeia divergente — reinicie o nó para convergir</span>`;
+                    }
+                }
+
+                const currentAddr = document.getElementById('addr').innerText;
+                if(currentAddr) {
+                    window.pywebview.api.get_balance(currentAddr).then(function(res) {
+                        if(res.balance !== undefined) {
+                            document.getElementById('saldo-atual').innerText = `${res.balance.toFixed(2)} BRN`;
+                            const pendBox = document.getElementById('saldo-pendente');
+                            const pendOut = res.pending_out || 0;
+                            const pendIn = res.pending_in || 0;
+                            if (pendOut > 0 || pendIn > 0) {
+                                pendBox.style.display = 'block';
+                                pendBox.innerHTML = `Disponível: <b>${res.available.toFixed(2)} BRN</b>` +
+                                    (pendOut > 0 ? ` &nbsp;·&nbsp; <span style="color:#f38ba8;">saída pendente: −${pendOut.toFixed(2)}</span>` : '') +
+                                    (pendIn > 0 ? ` &nbsp;·&nbsp; <span style="color:#a6e3a1;">entrada pendente: +${pendIn.toFixed(2)}</span>` : '');
+                            } else {
+                                pendBox.style.display = 'none';
+                            }
+                        }
+                    });
+                }
+
+                atualizarPeers();
+                atualizarExtrato();
+            });
+        }
+
+        function atualizarMempool(txs) {
+            const countEl = document.getElementById('mempool-count');
+            const listEl = document.getElementById('mempool-lista');
+            countEl.innerText = txs.length;
+            if (!txs.length) {
+                listEl.innerHTML = '<span class="mempool-empty">Nenhuma transação pendente.</span>';
+                return;
+            }
+            const myAddr = (document.getElementById('addr').innerText || '').trim();
+            listEl.innerHTML = txs.map(function(tx) {
+                const when = tx.timestamp ? new Date(tx.timestamp * 1000).toLocaleTimeString() : '—';
+                const isMineOut = myAddr && tx.sender === myAddr;
+                const isMineIn = myAddr && tx.receiver === myAddr;
+                const tag = isMineOut ? '<span class="badge pending">sua saída</span>'
+                          : isMineIn ? '<span class="badge pending">sua entrada</span>'
+                          : '<span class="badge">rede</span>';
+                return `<div class="mempool-row">
+                    <div>${tag} <b>${tx.amount.toFixed(2)} BRN</b><br>
+                        <span style="color:#7f849c;">${tx.sender.substring(0,12)}… → ${tx.receiver.substring(0,12)}…</span></div>
+                    <div style="text-align:right; color:#bac2de;">${when}<br><span style="color:#7f849c; font-size:10px;">${(tx.txid || '').substring(0,12)}…</span></div>
+                </div>`;
+            }).join('');
+        }
+
+        function carregarInfoP2P() {
+            window.pywebview.api.get_local_ips().then(function(info) {
+                document.getElementById('p2p-local-info').innerText = info.loopback;
+                const lanBox = document.getElementById('p2p-lan-info');
+                if (info.lan_addresses && info.lan_addresses.length) {
+                    lanBox.innerHTML = '<b style="font-size:12px;">Endereços na rede (informe ao outro computador):</b><br>' +
+                        info.lan_addresses.map(function(a) { return `<span class="peer-chip">${a}</span>`; }).join('');
+                } else {
+                    lanBox.innerHTML = '<span class="empty">Nenhum endereço de LAN detectado.</span>';
+                }
+            });
+        }
+
+        function atualizarPeers() {
+            window.pywebview.api.get_connected_peers().then(function(res) {
+                document.getElementById('peer-count').innerText = res.count;
+                const list = document.getElementById('peer-list');
+                if (res.peers && res.peers.length) {
+                    list.innerHTML = res.peers.map(function(p) {
+                        return `<span class="peer-chip">🟢 ${p.ip}:${p.port}</span>`;
+                    }).join('');
+                } else {
+                    list.innerHTML = '<span class="empty">Nenhum par conectado. Clique em "Conectar e Sincronizar" (nos dois computadores) ou configure bootstrap_peers.json.</span>';
+                }
+            });
+        }
+
+        function atualizarExtrato() {
+            const addr = (document.getElementById('addr').innerText || '').trim();
+            const box = document.getElementById('extrato-lista');
+            const resumo = document.getElementById('extrato-resumo');
+            if (!addr) {
+                resumo.innerText = '—';
+                box.innerHTML = '<span class="empty">Crie ou importe uma carteira para ver o extrato.</span>';
+                return;
+            }
+            window.pywebview.api.get_transaction_history(addr).then(function(res) {
+                if (res.status !== 'sucesso') {
+                    resumo.innerText = '—';
+                    box.innerHTML = `<span class="empty">${res.message || 'Erro ao carregar o extrato.'}</span>`;
+                    return;
+                }
+                const h = res.history || [];
+                const totalIn = h.filter(function(e) { return e.direction === 'entrada'; }).reduce(function(s, e) { return s + e.amount; }, 0);
+                const totalOut = h.filter(function(e) { return e.direction === 'saida'; }).reduce(function(s, e) { return s + e.amount; }, 0);
+                resumo.innerHTML = `<span class="tx-in">▲ Entradas: ${totalIn.toFixed(2)} BRN</span> &nbsp;|&nbsp; <span class="tx-out">▼ Saídas: ${totalOut.toFixed(2)} BRN</span> &nbsp;|&nbsp; ${h.length} lançamento(s)`;
+                if (!h.length) {
+                    box.innerHTML = '<span class="empty">Nenhuma transação encontrada para este endereço.</span>';
+                    return;
+                }
+                const labels = { genese: 'Gênese', mineracao: 'Mineração', recebido: 'Recebido', enviado: 'Enviado' };
+                box.innerHTML = h.map(function(e) {
+                    const isIn = e.direction === 'entrada';
+                    const cls = isIn ? 'tx-in' : 'tx-out';
+                    const arrow = isIn ? '⬇️' : '⬆️';
+                    const sign = isIn ? '+' : '−';
+                    const when = e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—';
+                    const badge = e.status === 'pendente'
+                        ? '<span class="badge pending">pendente</span>'
+                        : `<span class="badge">bloco #${e.block_index} · ${e.confirmations} conf.</span>`;
+                    const cp = (e.counterparty || '—');
+                    const cpShort = cp.length > 20 ? cp.substring(0, 20) + '…' : cp;
+                    return `<div class="tx-row">
+                        <div>
+                            <div class="${cls}">${arrow} ${labels[e.type] || e.type} &nbsp;<b>${sign}${e.amount.toFixed(2)} BRN</b></div>
+                            <div class="tx-meta">${isIn ? 'de' : 'para'} ${cpShort} · ${when}</div>
+                        </div>
+                        <div>${badge}</div>
+                    </div>`;
+                }).join('');
+            });
+        }
+
+        function conectarEEnviarBlocos() {
+            const ip = (document.getElementById('peer-ip').value || '').trim();
+            const port = document.getElementById('peer-port').value;
+            if(!ip) { alert("Insira o IP de rede do OUTRO computador (ex: 192.168.0.20)."); return; }
+            if(!port) { alert("Insira a porta P2P!"); return; }
+            if(ip === '127.0.0.1' || ip === 'localhost') {
+                alert("127.0.0.1 é este próprio computador. Informe o IP de rede do OUTRO micro (veja 'Endereços na rede' no outro aparelho).");
+                return;
+            }
+            window.pywebview.api.connect_and_sync(ip, parseInt(port)).then(function(res) {
+                alert(res.message);
+                atualizarTela();
+            });
+        }
+
+        function gerarNovaCarteira() {
+            window.pywebview.api.generate_wallet().then(function(data) {
+                mostrarChavesNaTela(data.address, data.spend_secret_key, data.public_key);
+            });
+        }
+
+        function mostrarChavesNaTela(addr, sk, pk) {
+            document.getElementById('resultado-carteira').style.display = 'block';
+            document.getElementById('addr').innerText = addr;
+            document.getElementById('s_key').innerText = sk;
+            document.getElementById('p_key').innerText = pk;
+            document.getElementById('tx-sender').value = addr;
+            atualizarTela();
+        }
+
+        async function copiarEnderecoRecebimento() {
+            const endereco = document.getElementById('addr').innerText.trim();
+            if (!endereco) {
+                alert('Crie ou importe uma carteira antes de copiar o endereço.');
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(endereco);
+                const botao = document.getElementById('btn-copiar-endereco');
+                const textoOriginal = botao.innerText;
+                botao.innerText = '✅ Endereço copiado';
+                setTimeout(() => { botao.innerText = textoOriginal; }, 1800);
+            } catch (erro) {
+                alert('Não foi possível copiar automaticamente. Copie o endereço exibido acima.');
+            }
+        }
+
+        function salvarCarteiraFisica() {
+            const filename = document.getElementById('wallet-filename').value;
+            const password = document.getElementById('wallet-password').value;
+            const address = document.getElementById('addr').innerText;
+            const spend_key = document.getElementById('s_key').innerText;
+            const pub_key = document.getElementById('p_key').innerText;
+
+            if (!filename || !password || !address) {
+                alert("Gere uma carteira e defina nome/senha para exportar!");
+                return;
+            }
+            window.pywebview.api.save_encrypted_wallet(filename, password, address, spend_key, pub_key).then(function(res) {
+                alert(res.message);
+            });
+        }
+
+        function carregarCarteiraFisica() {
+            const filename = document.getElementById('wallet-filename').value;
+            const password = document.getElementById('wallet-password').value;
+            if (!filename || !password) {
+                alert("Insira o nome do arquivo e a senha!");
+                return;
+            }
+            window.pywebview.api.load_encrypted_wallet(filename, password).then(function(res) {
+                if (res.status === "sucesso") {
+                    alert("Carteira carregada com sucesso!");
+                    mostrarChavesNaTela(res.address, res.spend_secret_key, res.public_key);
+                } else {
+                    alert(res.message);
+                }
+            });
+        }
+
+        function transferirMoedas() {
+            const sender = document.getElementById('tx-sender').value;
+            const receiver = document.getElementById('tx-receiver').value;
+            const amount = document.getElementById('tx-amount').value;
+            const sk = document.getElementById('s_key').innerText;
+            const pk = document.getElementById('p_key').innerText;
+
+            if(!sk || !pk) {
+                alert("A carteira de origem precisa estar carregada para assinar a transação!");
+                return;
+            }
+
+            window.pywebview.api.send_funds(sender, receiver, amount, sk, pk).then(function(res) {
+                alert(res.message);
+                atualizarTela();
+            });
+        }
+
+        function alternarMineracao() {
+            const currentAddr = document.getElementById('addr').innerText;
+            if (!currentAddr) {
+                alert("Crie ou carregue uma carteira antes de iniciar a mineração para receber as recompensas!");
+                return;
+            }
+            
+            window.pywebview.api.toggle_continuous_mining(currentAddr).then(function(res) {
+                alert(res.message);
+                atualizarTela();
+            });
+        }
+
+        window.addEventListener('pywebviewready', function() {
+            carregarInfoP2P();
+            atualizarTela();
+            setInterval(atualizarTela, 3000); // Polling contínuo para manter interface atualizada
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# Dados do nó (cadeia + mempool)
+blockchain_node_*.db
+mempool_node_*.json
+
+# Carteiras (nunca versionar chaves)
+wallets/
+
+# Build / PyInstaller
+build/
+dist/
+*.spec.bak
+
+# SO
+.DS_Store
+Thumbs.db
