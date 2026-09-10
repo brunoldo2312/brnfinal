@@ -1,3 +1,81 @@
+🚀 Passo 1: Criar uma Conta no Ngrok
+
+1. Acesse https://dashboard.ngrok.com/signup e crie uma conta gratuita.
+2. Após o login, o painel exibirá o seu Authtoken (uma sequência longa de letras e números). Copie-o, pois você precisará dele no próximo passo.
+
+💾 Passo 2: Instalar o Ngrok no Linux (Ubuntu/Debian)
+
+No terminal do seu computador, execute os comandos abaixo para instalar via apt (a forma mais simples):
+
+```bash
+curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | \
+  sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null && \
+  echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | \
+  sudo tee /etc/apt/sources.list.d/ngrok.list && \
+  sudo apt update && \
+  sudo apt install ngrok
+```
+
+Caso prefira baixar o binário diretamente:
+
+```bash
+wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+tar xvzf ngrok-v3-stable-linux-amd64.tgz
+sudo mv ngrok /usr/local/bin/
+```
+
+Após a instalação, verifique se funcionou com ngrok version.
+
+🔑 Passo 3: Conectar o Ngrok à Sua Conta
+
+Execute o comando abaixo, substituindo SEU_TOKEN_AQUI pelo Authtoken que você copiou no Passo 1:
+
+```bash
+ngrok config add-authtoken SEU_TOKEN_AQUI
+```
+
+Isso vincula o Ngrok instalado na sua máquina à sua conta.
+
+⛓️ Passo 4: Iniciar o Explorador de Blocos
+
+Em um terminal, navegue até a pasta do projeto e execute o explorador (criado anteriormente) na porta 8080:
+
+```bash
+python3 explorer.py
+```
+
+Mantenha este terminal aberto. O explorador precisa estar rodando para que o Ngrok consiga redirecionar o tráfego para ele.
+
+🌐 Passo 5: Criar o Túnel Público com Ngrok
+
+Abra outro terminal e execute:
+
+```bash
+ngrok http 8080
+```
+
+Você verá uma saída semelhante a esta (o link é um exemplo):
+
+```
+Forwarding    https://abcd-1234.ngrok-free.app -> http://localhost:8080
+```
+
+O endereço https://abcd-1234.ngrok-free.app é o seu link público temporário. Qualquer pessoa que acessá-lo verá o seu explorador de blocos.
+
+📋 Passo 6: Preencher o Formulário da Exchange
+
+No formulário da cexswap.cc, no campo "Explorador de blocos", cole o link que o Ngrok gerou (ex: https://abcd-1234.ngrok-free.app). O link deve começar com https://.
+
+---
+
+⚠️ Avisos Importantes sobre a "Opção Rápida"
+
+· Temporário: O link gerado pelo Ngrok é efêmero. Ele expira assim que você fecha o terminal do Ngrok ou desliga o computador. Se a exchange fizer uma verificação depois, o link estará quebrado.
+· Limitações do Plano Gratuito: Contas gratuitas do Ngrok têm restrições de tempo de sessão e número de conexões simultâneas. Para um uso mais estável, seria necessário um plano pago.
+· Segurança: Expor seu computador local à internet traz riscos. O Ngrok cria um túnel, mas não substitui a segurança de um servidor dedicado. Certifique-se de que seu explorador não exponha dados sensíveis.
+· Não é uma Solução Definitiva: Para que a exchange aceite e mantenha a listagem, o ideal é hospedar o explorador em uma VPS (Servidor Virtual Privado) com um domínio próprio. O Ngrok é excelente para testes rápidos, mas não é indicado para produção.
+
+Resumo: Use o Ngrok para obter o link rapidamente e preencher o formulário, mas esteja ciente de que a exchange pode rejeitar a solicitação por causa da natureza temporária do link. O próximo passo recomendado é migrar o explorador para uma hospedagem permanente.
 # 💼 Moeda Bruno (BRN) - Carteira Avançada & Blockchain P2P
 
 A **Moeda Bruno (BRN)** é uma implementação experimental de um ecossistema de criptomoeda descentralizado baseado em princípios acadêmicos do protocolo *CryptoNote/Monero*. O projeto apresenta uma arquitetura modular com um livro-razão imutável, sincronização autônoma de nós Peer-to-Peer (P2P), propagação de transações via Mempool Broadcast e um utilitário automático de redirecionamento de portas (UPnP).
