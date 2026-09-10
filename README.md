@@ -1,3 +1,76 @@
+✅ O que você precisa fazer
+Você ainda não baixou o projeto. Precisa clonar primeiro. Siga exatamente estes comandos, um de cada vez:
+
+1. Volte uma pasta (para não clonar dentro de brn)
+No terminal, digite:
+
+cmd
+cd ..
+Agora você estará em C:\Users\mayra\OneDrive\Imagens\bruno crypto\.
+
+2. Clone o repositório
+cmd
+git clone https://github.com/brunoldo2312/brnfinal.git
+Isso vai criar uma nova pasta chamada brnfinal com todos os arquivos do projeto. Se der erro dizendo que git não é reconhecido, você precisa instalar o Git primeiro: https://git-scm.com/download/win
+
+3. Entre na pasta clonada
+cmd
+cd brnfinal
+4. Veja o que tem dentro
+cmd
+dir
+Agora sim você deve ver os arquivos do projeto: package.json, iniciar.bat, README.md, etc. Só a partir daqui os comandos npm install e iniciar.bat vão funcionar.
+
+5. A partir daqui, siga um destes caminhos:
+Se existir iniciar.bat (o arquivo que você mencionou):
+
+cmd
+iniciar.bat
+Se existir package.json (projeto Node.js):
+
+cmd
+npm install
+npm start
+⚠️ Um alerta importante sobre o OneDrive
+Sua pasta está dentro do OneDrive (C:\Users\mayra\OneDrive\...). Isso costuma causar problemas com projetos de programação, porque:
+
+O OneDrive fica sincronizando arquivos enquanto o npm/node tenta ler e escrever
+
+Isso pode causar erros estranhos, lentidão e arquivos "travados"
+
+Recomendação: clone o projeto em uma pasta fora do OneDrive, por exemplo:
+
+cmd
+cd C:\
+mkdir projetos
+cd projetos
+git clone https://github.com/brunoldo2312/brnfinal.git
+📋 Resumo do que aconteceu
+O que você fez	O que deveria ter feito
+Colou a URL no terminal	Rodar git clone <URL>
+Rodou npm install numa pasta vazia	Clonar o projeto primeiro, depois entrar na pasta
+Tentou rodar iniciar.bat que não existe	Primeiro clonar, depois conferir se o arquivo existe
+Rode o passo 2 (git clone ...) e me diga o que apareceu. Se der certo, rode dir dentro da pasta brnfinal e me mande a lista de arquivos — assim eu te digo exatamente qual comando usar para iniciar.
+
+Agora sim, deu certo! 🎉 O projeto foi clonado com sucesso e vejo que você já tem os arquivos dentro da pasta brnfinal. E olha só: é um projeto em Python, não em Node.js. Isso explica por que o npm install não funcionou antes — não tinha nada a ver com Node.
+
+📋 O que você tem aí
+Olhando a lista de arquivos, dá para identificar:
+
+Arquivo	O que é
+iniciar_brn.bat	✅ Provavelmente é o seu "iniciar tudo de uma vez"
+iniciar_brn.cmd	Outra versão do inicializador
+instalar_ngrok.bat	Instalador do ngrok (usado para expor serviços localmente)
+main.py, explorer.py, crypto_wallet.py	Código Python do projeto
+blockchain_node_6001.db	Banco de dados do nó da blockchain
+index.html	Página web do projeto
+README.md	Documentação
+LICENSE	Licença
+✅ Como executar
+Como você está na pasta certa (brnfinal), agora basta rodar:
+
+cmd
+iniciar_brn.bat
 explorador de blocos  no link https://seventy-rigging-ploy.ngrok-free.dev
 1. Localmente (na sua própria máquina)
 Abra o navegador em:
