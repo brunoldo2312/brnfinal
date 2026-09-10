@@ -1,3 +1,54 @@
+🖥️ Opção 1: Prompt de Comando (CMD)
+
+No CMD, a sintaxe VAR=valor do Linux não funciona. Usamos set e && para encadear os comandos. Copie e cole:
+
+```cmd
+set "NGROK_AUTHTOKEN=3J8xHeVX46aXrOZeXnKrVVFMLTr_6tcrWjc6EaxX218rXJwJ4" && python main.py
+```
+
+⚡ Opção 2: PowerShell
+
+Se você usa o PowerShell, a sintaxe é um pouco diferente:
+
+```powershell
+$env:NGROK_AUTHTOKEN="3J8xHeVX46aXrOZeXnKrVVFMLTr_6tcrWjc6EaxX218rXJwJ4"; python main.py
+```
+
+---
+
+📄 Opção 3: Criar um Script .cmd (Recomendado)
+
+Se você quiser dar apenas um duplo clique para rodar tudo, crie um arquivo chamado iniciar_brn.cmd na mesma pasta do seu main.py e cole o código abaixo. Ele configura o token e inicia o programa automaticamente:
+
+```cmd
+@echo off
+title Iniciar Moeda Bruno (BRN) com Ngrok
+cd /d "%~dp0"
+
+echo ========================================================
+echo       CONFIGURANDO TOKEN DO NGROK E INICIANDO O NO
+echo ========================================================
+echo.
+
+:: Token configurado abaixo
+set "NGROK_AUTHTOKEN=3J8xHeVX46aXrOZeXnKrVVFMLTr_6tcrWjc6EaxX218rXJwJ4"
+
+echo Token configurado. Iniciando main.py...
+echo.
+
+python main.py
+
+echo.
+echo O programa foi encerrado.
+pause
+```
+
+📌 Observações Importantes:
+
+1. O main.py inicia o Ngrok sozinho? Se o seu main.py já estiver programado para ler a variável NGROK_AUTHTOKEN e criar o túnel automaticamente, os comandos acima funcionarão perfeitamente.
+2. Se o main.py não iniciar o Ngrok: Você precisará abrir outro terminal e rodar ngrok http 8080 manualmente, como fizemos nos passos anteriores.
+3. Substitua o token: Novamente, use o token apenas para testar e depois troque-o no painel do Ngrok por um novo, mantendo este em segredo.
+
 🚀 Passo 1: Criar uma Conta no Ngrok
 
 1. Acesse https://dashboard.ngrok.com/signup e crie uma conta gratuita.
