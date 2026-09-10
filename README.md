@@ -1,3 +1,4 @@
+explorador de blocos  no link https://seventy-rigging-ploy.ngrok-free.dev
 1. Localmente (na sua própria máquina)
 Abra o navegador em:
 
