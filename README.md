@@ -1,3 +1,208 @@
+📋 Conteúdo do executar_windows.cmd
+cmd
+@echo off
+chcp 65001 >nul
+setlocal EnableDelayedExpansion
+title Moeda Bruno (BRN) - Executar no Windows
+
+REM ============================================================
+REM   MOEDA BRUNO (BRN) - Script de Execucao Automatica Windows
+REM ============================================================
+
+REM ---- CONFIGURACOES (ajuste se quiser) ----
+set "PORTA=6001"
+set "VENV_DIR=env"
+set "PYTHON_MIN=3.10"
+
+REM ---- Ir para a pasta do script ----
+cd /d "%~dp0"
+
+echo.
+echo ============================================================
+echo   MOEDA BRUNO (BRN) - Inicializacao
+echo ============================================================
+echo   Pasta: %CD%
+echo   Porta: %PORTA%
+echo ============================================================
+echo.
+
+REM ============================================================
+REM  ETAPA 1 - Verificar Python
+REM ============================================================
+echo [1/7] Verificando Python...
+
+where python >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo [ERRO] Python nao foi encontrado no PATH.
+    echo.
+    echo Instale com o comando abaixo em outro CMD:
+    echo   winget install --id Python.Python.3.12 -e --source winget
+    echo.
+    echo Depois FECHE este CMD, abra outro e rode de novo.
+    pause
+    exit /b 1
+)
+
+for /f "tokens=2" %%v in ('python --version 2^>^&1') do set "PYVER=%%v"
+echo     Python detectado: !PYVER!
+echo.
+
+REM ============================================================
+REM  ETAPA 2 - Criar ambiente virtual (se nao existir)
+REM ============================================================
+echo [2/7] Preparando ambiente virtual...
+
+if not exist "%VENV_DIR%\Scripts\activate.bat" (
+    echo     Criando ambiente virtual em .\%VENV_DIR% ...
+    python -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo [ERRO] Falha ao criar o ambiente virtual.
+        pause
+        exit /b 1
+    )
+    echo     Ambiente virtual criado.
+) else (
+    echo     Ambiente virtual ja existe.
+)
+echo.
+
+REM ============================================================
+REM  ETAPA 3 - Ativar ambiente virtual
+REM ============================================================
+echo [3/7] Ativando ambiente virtual...
+call "%VENV_DIR%\Scripts\activate.bat"
+if errorlevel 1 (
+    echo [ERRO] Falha ao ativar o ambiente virtual.
+    pause
+    exit /b 1
+)
+echo     Ambiente ativado: %VIRTUAL_ENV%
+echo.
+
+REM ============================================================
+REM  ETAPA 4 - Instalar dependencias
+REM ============================================================
+echo [4/7] Verificando dependencias Python...
+
+python -c "import flask, webview, cryptography, ecdsa" >nul 2>nul
+if errorlevel 1 (
+    echo     Instalando dependencias (pode demorar alguns minutos)...
+    python -m pip install --upgrade pip >nul
+    pip install pywebview flask pyqt6 PyQt6-WebEngine qtpy ecdsa cryptography
+    if errorlevel 1 (
+        echo [ERRO] Falha ao instalar dependencias.
+        pause
+        exit /b 1
+    )
+    echo     Dependencias instaladas com sucesso.
+) else (
+    echo     Todas as dependencias ja estao instaladas.
+)
+echo.
+
+REM ============================================================
+REM  ETAPA 5 - Limpar bancos antigos (evita conflito de genese)
+REM ============================================================
+echo [5/7] Limpando arquivos temporarios...
+
+if exist "*.db" (
+    del /q "*.db" 2>nul
+    echo     Bancos .db removidos.
+)
+if exist "mempool_node_*.json" (
+    del /q "mempool_node_*.json" 2>nul
+    echo     Mempools .json removidas.
+)
+if exist "__pycache__" (
+    rmdir /s /q "__pycache__" 2>nul
+    echo     Cache __pycache__ removido.
+)
+echo.
+
+REM ============================================================
+REM  ETAPA 6 - Liberar porta no Firewall
+REM ============================================================
+echo [6/7] Configurando firewall para a porta %PORTA%...
+
+netsh advfirewall firewall show rule name="Bruno BRN %PORTA%" >nul 2>nul
+if errorlevel 1 (
+    netsh advfirewall firewall add rule name="Bruno BRN %PORTA%" dir=in action=allow protocol=TCP localport=%PORTA% >nul 2>nul
+    if errorlevel 1 (
+        echo     [AVISO] Nao foi possivel adicionar regra de firewall.
+        echo             Execute este script como Administrador para liberar a porta.
+    ) else (
+        echo     Regra de firewall criada para a porta %PORTA%.
+    )
+) else (
+    echo     Regra de firewall ja existe para a porta %PORTA%.
+)
+echo.
+
+REM ============================================================
+REM  ETAPA 7 - Iniciar o no
+REM ============================================================
+echo [7/7] Iniciando o no Moeda Bruno na porta %PORTA%...
+echo.
+echo ============================================================
+echo   Pressione CTRL+C na janela para encerrar o no.
+echo ============================================================
+echo.
+
+python bruno_blockchain_real.py %PORTA%
+
+echo.
+echo ============================================================
+echo   No encerrado.
+echo ============================================================
+echo.
+pause
+endlocal
+🚀 Como rodar
+Botão direito no arquivo → "Executar como administrador"
+
+Ele vai:
+
+✅ Verificar Python
+
+✅ Criar env\ (se não existir)
+
+✅ Ativar o ambiente
+
+✅ Instalar todas as dependências
+
+✅ Limpar .db, .json e __pycache__
+
+✅ Criar regra de firewall
+
+✅ Iniciar o app na porta 6001
+
+🔧 Variações de uso
+Rodar em outra porta
+Abra o arquivo no Notepad e mude a linha:
+
+cmd
+set "PORTA=6001"
+Para:
+
+cmd
+set "PORTA=6002"
+Rodar sem abrir como admin
+Funciona, mas pode pular a etapa de firewall (é só um aviso).
+
+Criar também um atalho de terminal
+Salve o arquivo com a extensão .bat em vez de .cmd — mesmo comportamento.
+
+🆘 Solução de problemas
+Erro	Causa	Solução
+Python nao foi encontrado	Python não instalado	winget install Python.Python.3.12
+Falha ao criar ambiente virtual	Python muito antigo	Atualize para 3.10+
+Access is denied ao liberar firewall	Não rodou como admin	Botão direito → Executar como Administrador
+Janela não abre	PyQt6 ausente	Rode manualmente: pip install pyqt6 PyQt6-WebEngine
+Porta em uso	Outro processo Python	Troque para 6002, 6003...
+App trava ao iniciar	Banco antigo corrompido	Delete manualmente *.db e mempool_node_*.json
+📌 Para conectar uma segunda máquina
+Na segunda máquina, copie este mesmo arquivo para a pasta do projeto, ajuste set "PORTA=6002" e execute. Depois, na interface gráfica, use "Rede Descentralizada" → informe IP e porta do primeiro PC.
 # 💼 Moeda Bruno (BRN) - Carteira Avançada & Blockchain P2P
 
 A **Moeda Bruno (BRN)** é uma implementação experimental de um ecossistema de criptomoeda descentralizado baseado em princípios acadêmicos do protocolo *CryptoNote/Monero*. O projeto apresenta uma arquitetura modular com um livro-razão imutável, sincronização autônoma de nós Peer-to-Peer (P2P), propagação de transações via Mempool Broadcast e um utilitário automático de redirecionamento de portas (UPnP).
