@@ -32,22 +32,16 @@ COIN_SYMBOL = "BRN"
 BLOCK_REWARD = 1.0
 GENESIS_ADDRESS = "brn1111cd943fa71e1f91dcd62f52fc6138bc845ab"
 GENESIS_AMOUNT = 100000.0
-# Gênese determinístico: timestamp/nonce/hash fixos garantem que TODO nó crie o
-# mesmo bloco 0 (mesmo hash). Sem isso cada computador gerava uma gênese com
-# time.time() e criava uma cadeia própria incompatível — era a causa de "enviei
-# mas o outro não recebeu" (duas blockchains que nunca se fundem).
 GENESIS_TIMESTAMP = 1700000000.0
 GENESIS_NONCE = 171419
 GENESIS_HASH = "0000d904d5f2954d5c9aa43eafed2f885ad17c5047605ed6e385458b590fcaff"
 GENESIS_DIFFICULTY = 4
-DIFFICULTY_ADJUSTMENT_INTERVAL = 5  # Ajusta a cada 5 blocos
-TARGET_BLOCK_TIME = 10.0  # Tempo ideal por bloco em segundos
+DIFFICULTY_ADJUSTMENT_INTERVAL = 5
+TARGET_BLOCK_TIME = 10.0
 MAX_DIFFICULTY = 8
 MAX_BLOCK_TRANSACTIONS = 1_000
 MAX_FUTURE_SECONDS = 120
 MONERO_FORK_NETWORK_ID = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]
-# Descoberta automática na LAN: cada nó anuncia a própria porta via UDP broadcast
-# neste canal e os demais nós conectam/sincronizam sem digitar IP manualmente.
 DISCOVERY_UDP_PORT = 6010
 DISCOVERY_INTERVAL_SECONDS = 5
 
@@ -58,11 +52,6 @@ DEFAULT_BOOTSTRAP_PEERS = [
 
 
 def _load_bootstrap_peers():
-    """Carrega nós iniciais de bootstrap_peers.json (se existir).
-
-    Permite apontar para um nó com IP público em outra região sem editar o
-    código. Formato esperado: [{"ip": "1.2.3.4", "port": 6001}, ...].
-    """
     try:
         with open(BOOTSTRAP_PEERS_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -128,7 +117,6 @@ class CriptoAPI:
         self.peers_lock = threading.Lock()
         self.chain_lock = threading.RLock()
         
-        # Controle de Mineração Contínua
         self.is_mining = False
         self.mining_stop_event = threading.Event()
         self.miner_thread = None
@@ -161,14 +149,6 @@ class CriptoAPI:
                 self.db.insert_block(genesis)
 
     def _converge_to_shared_genesis(self):
-        """Garante que este nó use a gênese padrão da rede.
-
-        Se o banco local tem uma gênese divergente (criada por versão antiga com
-        time.time()), ele NÃO compartilha a mesma blockchain que os outros micros
-        e recusa sincronização. Aqui fazemos backup do banco divergente (renomear,
-        nunca apagar) e recriamos a gênese determinística, convergindo todos os
-        nós para uma única cadeia automaticamente.
-        """
         if not os.path.exists(self.db_path):
             return
         conn = None
@@ -203,7 +183,6 @@ class CriptoAPI:
 
     @staticmethod
     def _make_genesis():
-        """Bloco 0 idêntico em todos os nós (timestamp/nonce/hash fixos)."""
         return BrunoBlock(
             0, "0",
             [{"sender": "SISTEMA", "receiver": GENESIS_ADDRESS, "amount": GENESIS_AMOUNT}],
@@ -214,7 +193,6 @@ class CriptoAPI:
         )
 
     def _load_mempool(self):
-        """Restaura a mempool do disco. Transações já confirmadas na cadeia são descartadas."""
         try:
             with open(self.mempool_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
@@ -235,7 +213,6 @@ class CriptoAPI:
                 self.mempool = []
 
     def _save_mempool(self):
-        """Persiste a mempool atual no disco (chamar com mempool_lock já adquirido)."""
         try:
             with open(self.mempool_path, "w", encoding="utf-8") as f:
                 json.dump(self.mempool, f)
@@ -243,7 +220,6 @@ class CriptoAPI:
             pass
 
     def _prune_mempool(self):
-        """Remove da mempool transações que já foram confirmadas na cadeia local."""
         confirmed = {
             item.get("txid", self._transaction_id(item))
             for block in self.db.get_raw_chain() for item in block["transactions"]
@@ -276,9 +252,6 @@ class CriptoAPI:
             pass
 
     def _accept_broadcast_tx(self, tx_data, from_ip):
-        """Aceita uma tx recebida da rede. Se o saldo do remetente ainda não é
-        visível na cadeia local (nó desatualizado), guarda na fila de órfãs e
-        dispara uma sincronização — em vez de descartar e o destinatário nunca ver."""
         if not self._verify_tx_structure(tx_data):
             return
         try:
@@ -296,7 +269,6 @@ class CriptoAPI:
             if any(item.get("txid", self._transaction_id(item)) == txid for item in self.mempool):
                 return
         if self._available_balance(tx_data["sender"], txid) < Decimal(str(tx_data["amount"])):
-            # Cadeia local provavelmente está atrás: adia e tenta se atualizar.
             with self.orphan_lock:
                 if not any(o.get("txid") == txid for o in self.orphan_txs):
                     self.orphan_txs.append({**tx_data, "txid": txid})
@@ -311,7 +283,6 @@ class CriptoAPI:
         threading.Thread(target=self._relay_transaction, args=(tx_data, from_ip), daemon=True).start()
 
     def _promote_orphans(self):
-        """Revalida a fila de órfãs contra a cadeia atual e promove as que já têm saldo."""
         with self.orphan_lock:
             candidates = list(self.orphan_txs)
         if not candidates:
@@ -347,7 +318,6 @@ class CriptoAPI:
                 threading.Thread(target=self._relay_transaction, args=(tx, ""), daemon=True).start()
 
     def _sync_from_all_peers(self):
-        """Puxa a cadeia de todos os pares conhecidos (usado quando uma tx órfã chega)."""
         with self.peers_lock:
             targets = list(self.connected_peers)
         for ip, port in targets:
@@ -361,7 +331,6 @@ class CriptoAPI:
         return self.p2p_port
 
     def _calculate_next_difficulty(self) -> int:
-        """Ajuste dinâmico de dificuldade baseado no tempo gasto nos ultimos blocos"""
         chain = self.db.get_raw_chain()
         if len(chain) < DIFFICULTY_ADJUSTMENT_INTERVAL + 1:
             return chain[-1]["difficulty"]
@@ -398,13 +367,6 @@ class CriptoAPI:
         return data.decode('utf-8', errors='ignore')
 
     def _request_peer(self, ip, port, message, timeout=5.0):
-        """Envia um pedido a um nó e devolve a resposta completa.
-
-        O shutdown(SHUT_WR) é essencial: sem ele o servidor remoto continua
-        aguardando EOF até o próprio timeout (5s) e só então responde, enquanto
-        quem pediu já desistiu (3s). Era isso que impedia GET_HEIGHT/GET_CHAIN
-        de concluir e fazia o nó "não enxergar" os demais.
-        """
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
@@ -431,9 +393,6 @@ class CriptoAPI:
                 elif data == "GET_CHAIN":
                     client_conn.sendall(json.dumps(self.db.get_raw_chain()).encode('utf-8'))
                 elif data.startswith("ANNOUNCE_PEER:"):
-                    # A porta de escuta de quem conecta não vem no endereço de
-                    # origem (é efêmera), então ele a anuncia. Validamos
-                    # reconectando antes de registrar, tornando o peer mútuo.
                     threading.Thread(
                         target=self._handle_peer_announcement,
                         args=(client_addr[0], data),
@@ -452,7 +411,6 @@ class CriptoAPI:
                 pass
 
     def _local_ip_addresses(self):
-        """Descobre os endereços IP desta máquina (loopback + LAN/WAN)."""
         ips = set()
         try:
             for info in socket.getaddrinfo(socket.gethostname(), None):
@@ -470,12 +428,14 @@ class CriptoAPI:
         ips.add("127.0.0.1")
         return ips
 
-    def _is_self(self, ip, port):
-        """True apenas se (ip, porta) aponta para este próprio nó.
+    def _primary_lan_ip(self):
+        """Retorna o melhor IP LAN desta máquina para anunciar via UDP broadcast."""
+        for ip in self._local_ip_addresses():
+            if "." in ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+                return ip
+        return "127.0.0.1"
 
-        A checagem antiga comparava só a porta e impedia conectar a outro
-        computador que usasse a mesma porta (ex.: dois nós em 6001).
-        """
+    def _is_self(self, ip, port):
         try:
             if int(port) != int(self.p2p_port):
                 return False
@@ -487,10 +447,7 @@ class CriptoAPI:
         return ip in self._local_ip_addresses()
 
     def get_local_ips(self):
-        """Endereços de escuta deste nó (o que informar ao outro computador)."""
         port = self.get_p2p_port()
-        # O servidor escuta em 0.0.0.0 (somente IPv4), então não adianta
-        # anunciar IPv6/link-local: o outro nó não conseguiria conectar.
         lan = sorted(
             ip for ip in self._local_ip_addresses()
             if "." in ip and not ip.startswith("127.") and not ip.startswith("169.254.")
@@ -525,7 +482,6 @@ class CriptoAPI:
             return False
 
     def _handle_peer_announcement(self, peer_ip, data):
-        """Registra um nó que se anunciou, após confirmar que ele é alcançável."""
         try:
             announced_port = int(data.split(":", 1)[1])
         except (ValueError, IndexError):
@@ -534,6 +490,66 @@ class CriptoAPI:
             return
         if self._ping_peer(peer_ip, announced_port):
             self._add_peer(peer_ip, announced_port)
+
+    # ============================================================
+    # DESCOBERTA AUTOMÁTICA NA LAN (UDP broadcast) — métodos que
+    # faltavam no arquivo original e causavam o AttributeError.
+    # ============================================================
+    def _start_discovery_listener(self):
+        """Escuta broadcasts UDP na porta DISCOVERY_UDP_PORT para descobrir
+        outros nós na mesma rede local e registrá-los automaticamente."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", DISCOVERY_UDP_PORT))
+        except OSError as e:
+            print(f"[discovery] Nao foi possivel escutar na porta UDP {DISCOVERY_UDP_PORT}: {e}")
+            return
+        print(f"[discovery] Escutando broadcasts UDP na porta {DISCOVERY_UDP_PORT}.")
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+                try:
+                    info = json.loads(data.decode("utf-8", errors="ignore"))
+                except (ValueError, TypeError):
+                    continue
+                peer_ip = str(info.get("ip") or addr[0]).strip()
+                try:
+                    peer_port = int(info.get("port"))
+                except (ValueError, TypeError):
+                    continue
+                if not peer_ip or not peer_port:
+                    continue
+                if self._is_self(peer_ip, peer_port):
+                    continue
+                with self.peers_lock:
+                    already = (peer_ip, peer_port) in self.connected_peers
+                if already:
+                    continue
+                threading.Thread(
+                    target=self._handle_peer_announcement,
+                    args=(peer_ip, f"ANNOUNCE_PEER:{peer_port}"),
+                    daemon=True,
+                ).start()
+            except Exception:
+                continue
+
+    def _discovery_announce_loop(self):
+        """Anuncia periodicamente a própria porta via UDP broadcast (255.255.255.255)
+        para que os outros nós da LAN nos encontrem sem digitar IP manualmente."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        print(f"[discovery] Anunciando este no na porta {self.p2p_port} via UDP broadcast.")
+        while True:
+            try:
+                payload = json.dumps({
+                    "ip": self._primary_lan_ip(),
+                    "port": self.p2p_port,
+                }).encode("utf-8")
+                sock.sendto(payload, ("255.255.255.255", DISCOVERY_UDP_PORT))
+            except Exception:
+                pass
+            time.sleep(DISCOVERY_INTERVAL_SECONDS)
 
     def _run_bootstrap_discovery(self):
         time.sleep(2)
@@ -546,7 +562,6 @@ class CriptoAPI:
                 pass
 
     def _peer_maintenance_loop(self):
-        """Remove peers que pararam de responder e reconecta aos nós conhecidos."""
         while True:
             time.sleep(15)
             try:
@@ -562,7 +577,6 @@ class CriptoAPI:
                         already = (str(ip).strip(), int(port)) in self.connected_peers
                     if not already:
                         self.connect_and_sync(ip, port)
-                # Tenta promover transações órfãs caso a cadeia tenha se atualizado.
                 with self.orphan_lock:
                     has_orphans = bool(self.orphan_txs)
                 if has_orphans:
@@ -584,7 +598,6 @@ class CriptoAPI:
                 self._remove_peer(ip, port)
 
     def _relay_transaction(self, tx, exclude_ip):
-        """Gossip: retransmite uma transação recebida aos demais pares, exceto o remetente original."""
         with self.peers_lock:
             targets = [(ip, port) for ip, port in self.connected_peers if ip != exclude_ip]
         for ip, port in targets:
@@ -611,14 +624,8 @@ class CriptoAPI:
                 }
             remote_height = int(self._request_peer(ip, port, "GET_HEIGHT", timeout=5.0))
 
-            # Registra o peer como alcançável MESMO quando a cadeia remota não é
-            # maior. Antes ele só era registrado após baixar uma cadeia maior,
-            # então blocos minerados e transações nunca eram propagados para
-            # nós "empatados" — causa comum de não enxergar o outro computador.
             self._add_peer(ip, port)
 
-            # Anuncia a própria porta para o remoto nos registrar de volta,
-            # tornando a conexão mútua mesmo quando só este lado a iniciou.
             try:
                 s_ann = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s_ann.settimeout(3.0)
@@ -630,9 +637,6 @@ class CriptoAPI:
 
             local_height = len(self.db.get_raw_chain())
             if remote_height <= local_height:
-                # Empurrar a cadeia local quando ela é maior: sem isso o par fica
-                # desatualizado e rejeita transações recebidas por "saldo
-                # insuficiente" do remetente (causa de "enviei mas não recebeu").
                 pushed = False
                 if remote_height < local_height:
                     try:
@@ -691,7 +695,6 @@ class CriptoAPI:
         return balance
 
     def _verify_tx_structure(self, tx) -> bool:
-        """Verifica se a transação possui formato e assinatura validos"""
         if not isinstance(tx, dict):
             return False
         
@@ -705,7 +708,6 @@ class CriptoAPI:
             timestamp = float(tx["timestamp"])
             if not timestamp or timestamp > time.time() + MAX_FUTURE_SECONDS:
                 return False
-            # Impede assinar com uma chave e declarar o endereço de outra carteira.
             if WalletManager.address_from_public_key(tx["public_key"]) != tx["sender"]:
                 return False
             payload = {"sender": tx["sender"], "receiver": tx["receiver"], "amount": amount, "timestamp": timestamp}
@@ -774,7 +776,6 @@ class CriptoAPI:
             return False
 
     def _validate_chain_transactions(self, chain):
-        """Reexecuta o ledger para bloquear gastos sem saldo e duplicidades."""
         balances = {}
         seen_txids = set()
         for block in chain:
@@ -891,7 +892,6 @@ class CriptoAPI:
             return {"status": "erro", "message": str(e)}
 
     def get_mempool(self):
-        """Lista todas as transações pendentes na mempool local."""
         with self.mempool_lock:
             pending = list(self.mempool)
         return {
@@ -909,7 +909,6 @@ class CriptoAPI:
         }
 
     def get_transaction_history(self, address):
-        """Extrato de envios e recebimentos de um endereço (chain confirmada + mempool)."""
         try:
             self._validate_address(address)
         except ValueError as e:
@@ -1010,7 +1009,6 @@ class CriptoAPI:
         except Exception as e:
             return {"status": "erro", "message": str(e)}
 
-    # Controladores de Mineração Contínua
     def toggle_continuous_mining(self, miner_address):
         if self.is_mining:
             self.is_mining = False
@@ -1051,7 +1049,6 @@ class CriptoAPI:
                 success = new_block.mine_block(stop_event=self.mining_stop_event)
                 if success and self.is_mining:
                     with self.chain_lock:
-                        # Não anexar sobre uma ponta que foi alterada durante a PoW.
                         current_tip = self.db.get_raw_chain()[-1]
                         if current_tip["hash"] != new_block.previous_hash:
                             continue
@@ -1083,8 +1080,6 @@ if __name__ == '__main__':
             p2p_port = int(sys.argv[1])
         except ValueError:
             pass
-    # UPnP não é ativado automaticamente: expor a carteira à internet sem a
-    # confirmação do dono é arriscado. A sincronização manual continua disponível.
     api_local = CriptoAPI(p2p_port)
     webview.create_window(title=f"Carteira Nativa {COIN_NAME} (Porta: {p2p_port})", url="index.html", js_api=api_local, width=740, height=800, resizable=True)
     webview.start()
