@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 run.py — setup completo em um comando.
-Requer install_brn.py na mesma pasta.
+Requer Instal.py na mesma pasta.
 Uso: python run.py
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import sys
 import venv
 
 IS_WINDOWS = platform.system() == "Windows"
+INSTALLER = "Instal.py"   # ← nome do seu arquivo
 
 
 def step(msg: str) -> None:
@@ -29,9 +30,14 @@ def main() -> int:
     here = pathlib.Path(__file__).resolve().parent
     os.chdir(here)
 
+    installer = here / INSTALLER
+    if not installer.exists():
+        print(f"ERRO: {INSTALLER} não encontrado em {here}", file=sys.stderr)
+        return 1
+
     # 1. Gera o projeto
-    step("Gerando projeto brn-prod/")
-    run([sys.executable, "install_brn.py"])
+    step(f"Rodando {INSTALLER}")
+    run([sys.executable, INSTALLER])
 
     project = here / "brn-prod"
     if not project.exists():
@@ -45,8 +51,7 @@ def main() -> int:
     if not env_path.exists():
         env_path.write_text(pathlib.Path(".env.example").read_text())
     txt = env_path.read_text()
-    if "BRN_NETWORK_KEY=\n" in txt or "BRN_NETWORK_KEY=" in txt and \
-       re.search(r"BRN_NETWORK_KEY=\s*$", txt, re.M):
+    if re.search(r"BRN_NETWORK_KEY=\s*$", txt, re.M):
         txt = re.sub(r"BRN_NETWORK_KEY=.*",
                      "BRN_NETWORK_KEY=" + secrets.token_hex(32), txt)
     if re.search(r"BRN_API_TOKEN=\s*$", txt, re.M):
@@ -76,7 +81,7 @@ def main() -> int:
     run([py_str, "-m", "pip", "install", "-q",
          "-r", "requirements-dev.txt"])
 
-    # 5. testes rápidos
+    # 5. testes
     step("Rodando testes")
     r = subprocess.run([py_str, "-m", "pytest", "-q"],
                        capture_output=True, text=True)
@@ -97,7 +102,7 @@ def main() -> int:
         os.chmod("mnemonic.txt", 0o600)
     m = re.search(r"(brn1[a-f0-9]{40})", r.stdout)
     if not m:
-        print("ERRO: não achei endereço na saída do hd-new", file=sys.stderr)
+        print("ERRO: endereço não encontrado em hd-new", file=sys.stderr)
         return 1
     addr = m.group(1)
     print(f"  endereço: {addr}")
@@ -107,7 +112,7 @@ def main() -> int:
     step("Inicializando cadeia")
     run([py_str, "-m", "brn.cli", "init", addr])
 
-    # 8. minera 3 blocos de teste
+    # 8. minera 3 blocos
     step("Minerando 3 blocos de demonstração")
     for i in range(3):
         print(f"  bloco {i+1}/3…")
@@ -119,8 +124,8 @@ def main() -> int:
     print(f"\n  API token: {api_token}")
     print("  Home:  http://127.0.0.1:8080/")
     print("  API:   http://127.0.0.1:8080/api/status")
-    print("  Teste: curl -H 'X-API-Token: " + api_token +
-          "' http://127.0.0.1:8080/api/status")
+    print(f"  Teste: curl -H 'X-API-Token: {api_token}' "
+          "http://127.0.0.1:8080/api/status")
     print("\n  Para habilitar NGROK, edite .env e rode:")
     print("    python -m brn.cli node --with-explorer --ngrok")
     print("\n  Ctrl+C para encerrar.\n")
