@@ -3,7 +3,7 @@ import os
 from cripto_wallet import WalletManager
 
 def menu():
-    print("\n=== BRN Wallet ===")
+    print("\n=== BRN Bruno ===")
     print("1 - Gerar nova carteira")
     print("2 - Salvar carteira cifrada")
     print("3 - Carregar carteira")
