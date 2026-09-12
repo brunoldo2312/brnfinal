@@ -1,0 +1,5 @@
+cryptography>=42.0.0
+argon2-cffi>=23.1.0
+ecdsa>=0.18.0
+requests>=2.31.0
+flask>=3.0.0
