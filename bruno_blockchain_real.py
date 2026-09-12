@@ -1,10 +1,10 @@
 # bruno_blockchain_real.py
 # Blockchain com:
-#   - SHA3-256 para hashes
-#   - Blocos assinados por ECDSA (validação por outros nós)
-#   - Persistência em SQLite (sobrevive a reinicializações)
-#   - Validação completa de transações (saldo, nonce, assinatura)
-#   - Consenso PoS simplificado
+#   - SHA3-256, blocos assinados por ECDSA
+#   - Persistência SQLite (cadeia, mempool, slashing, faucet)
+#   - Slashing de validadores maliciosos
+#   - Fork-choice estilo GHOST (peso por stake)
+#   - Faucet de bootstrap
 
 import hashlib
 import json
@@ -14,18 +14,35 @@ import threading
 import sqlite3
 import os
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set, Tuple
 
 from cripto_wallet import WalletManager
 
 NETWORK_ID = os.environ.get("BRN_NETWORK_ID", "brn-mainnet-1")
-BLOCK_REWARD = 50.0
-MIN_STAKE = 100.0
+BLOCK_REWARD = float(os.environ.get("BRN_BLOCK_REWARD", "50"))
+MIN_STAKE = float(os.environ.get("BRN_MIN_STAKE", "100"))
 DB_PATH = os.environ.get("BRN_DB_PATH", "blockchain.db")
+
+# Faucet
+FAUCET_ADDRESS = os.environ.get("BRN_FAUCET_ADDRESS", "").strip()
+FAUCET_AMOUNT = float(os.environ.get("BRN_FAUCET_AMOUNT", "100"))
+FAUCET_COOLDOWN = int(os.environ.get("BRN_FAUCET_COOLDOWN", "3600"))  # segundos
+
+# Alocação inicial: "endereco1:1000000,endereco2:500000"
+_raw_alloc = os.environ.get("BRN_GENESIS_ALLOC", "").strip()
+GENESIS_ALLOCATIONS: Dict[str, float] = {}
+if _raw_alloc:
+    for pair in _raw_alloc.split(","):
+        if ":" in pair:
+            addr, amt = pair.split(":", 1)
+            try:
+                GENESIS_ALLOCATIONS[addr.strip()] = float(amt.strip())
+            except ValueError:
+                pass
 
 
 # ------------------------------------------------------------------
-# Bloco (agora assinado pelo validador)
+# Bloco
 # ------------------------------------------------------------------
 @dataclass
 class Block:
@@ -57,18 +74,16 @@ class Block:
         self.hash = self.calculate_hash()
 
     def sign(self, private_key_hex: str):
-        """Assina o hash do bloco com a chave privada do validador."""
         if not self.hash:
             self.finalize()
         payload = {"block_hash": self.hash, "index": self.index}
         self.signature = WalletManager.sign_transaction(private_key_hex, payload)
 
     def verify(self) -> bool:
-        """Verifica integridade e assinatura do bloco."""
         if self.hash != self.calculate_hash():
             return False
         if self.index == 0:
-            return True  # gênese é confiada
+            return True
         if not self.validator_public_key or not self.signature:
             return False
         derived = WalletManager.address_from_public_key(self.validator_public_key)
@@ -122,9 +137,14 @@ class Transaction:
     def derived_address(tx: dict) -> str:
         return WalletManager.address_from_public_key(tx["public_key"])
 
+    @staticmethod
+    def hash(tx: dict) -> str:
+        raw = json.dumps(tx, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha3_256(raw).hexdigest()
+
 
 # ------------------------------------------------------------------
-# Estado (saldos, nonces)
+# Estado
 # ------------------------------------------------------------------
 class State:
     def __init__(self):
@@ -156,26 +176,31 @@ class State:
 
 
 # ------------------------------------------------------------------
-# Blockchain (com persistência SQLite e validação por bloco)
+# Blockchain
 # ------------------------------------------------------------------
 class Blockchain:
-    def __init__(self, db_path: str = DB_PATH, node_identity: Optional[dict] = None):
+    def __init__(self, db_path: str = DB_PATH, node_identity: Optional[dict] = None,
+                 genesis_allocations: Optional[Dict[str, float]] = None):
         self.db_path = db_path
         self.node_identity = node_identity
+        self.genesis_allocations = dict(genesis_allocations or GENESIS_ALLOCATIONS)
+
         self.chain: List[Block] = []
         self.pending: List[dict] = []
         self.state = State()
+        self.slashed: Set[str] = set()
         self.lock = threading.RLock()
 
         self._init_db()
         if not self._load_from_db():
             self._create_genesis()
             self._persist_block(self.chain[0])
+            self._rebuild_state()
             print("[chain] gênese criada e persistida.")
         else:
             print(f"[chain] {len(self.chain)} blocos carregados de {self.db_path}")
 
-    # ---------- SQLite ----------
+    # ---------------- SQLite ----------------
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
@@ -188,6 +213,27 @@ class Blockchain:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON blocks(hash)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS mempool (
+                    tx_hash   TEXT PRIMARY KEY,
+                    ts        REAL NOT NULL,
+                    data      TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS slashing (
+                    validator TEXT PRIMARY KEY,
+                    reason    TEXT,
+                    block_idx INTEGER,
+                    ts        REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS faucet_claims (
+                    address    TEXT PRIMARY KEY,
+                    last_claim REAL NOT NULL
+                )
+            """)
             conn.commit()
 
     def _persist_block(self, block: Block):
@@ -212,12 +258,110 @@ class Blockchain:
                 )
             conn.commit()
 
+    # ---------------- Mempool persistente ----------------
+    def _mempool_add(self, tx: dict):
+        txh = Transaction.hash(tx)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO mempool (tx_hash, ts, data) VALUES (?, ?, ?)",
+                (txh, time.time(), json.dumps(tx)),
+            )
+            conn.commit()
+
+    def _mempool_remove(self, tx: dict):
+        txh = Transaction.hash(tx)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM mempool WHERE tx_hash = ?", (txh,))
+            conn.commit()
+
+    def _mempool_clear(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM mempool")
+            conn.commit()
+
+    def _mempool_load(self):
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT data FROM mempool ORDER BY ts ASC").fetchall()
+        self.pending = []
+        for (data,) in rows:
+            try:
+                tx = json.loads(data)
+                if Transaction.verify_signature(tx):
+                    self.pending.append(tx)
+            except Exception:
+                continue
+        if self.pending:
+            print(f"[mempool] {len(self.pending)} tx recarregadas do disco.")
+
+    # ---------------- Slashing ----------------
+    def _load_slashed(self):
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT validator FROM slashing").fetchall()
+        self.slashed = {r[0] for r in rows}
+        if self.slashed:
+            print(f"[slashing] {len(self.slashed)} validador(es) banido(s) carregado(s).")
+
+    def _slash(self, validator: str, reason: str, block_idx: int = -1):
+        if not validator or validator == "genesis":
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO slashing (validator, reason, block_idx, ts) "
+                "VALUES (?, ?, ?, ?)",
+                (validator, reason, block_idx, time.time()),
+            )
+            conn.commit()
+        self.slashed.add(validator)
+        # Efeito imediato: zera saldo e incrementa nonce
+        if validator in self.state.balances:
+            self.state.balances[validator] = 0.0
+        self.state.nonces[validator] = self.state.nonce(validator) + 1
+        print(f"[slash] validador {validator[:16]}… banido ({reason})")
+
+    # ---------------- Faucet ----------------
+    def faucet(self, to_address: str, private_key_hex: str, public_key_hex: str) -> dict:
+        if not FAUCET_ADDRESS:
+            return {"ok": False, "msg": "Faucet desativado nesta rede."}
+        if FAUCET_ADDRESS != WalletManager.address_from_public_key(public_key_hex):
+            return {"ok": False, "msg": "Chave do faucet não corresponde."}
+
+        # Cooldown
+        now = time.time()
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT last_claim FROM faucet_claims WHERE address = ?",
+                (to_address,),
+            ).fetchone()
+        if row and (now - row[0]) < FAUCET_COOLDOWN:
+            remaining = int(FAUCET_COOLDOWN - (now - row[0]))
+            return {"ok": False, "msg": f"Aguarde {remaining}s para pedir novamente."}
+
+        # Monta tx do faucet → destinatário
+        tx = Transaction.build(
+            sender_address=FAUCET_ADDRESS,
+            receiver_address=to_address,
+            amount=FAUCET_AMOUNT,
+            nonce=self.state.nonce(FAUCET_ADDRESS),
+            private_key_hex=private_key_hex,
+            public_key_hex=public_key_hex,
+        )
+        r = self.add_transaction(tx)
+        if not r.get("ok"):
+            return r
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO faucet_claims (address, last_claim) VALUES (?, ?)",
+                (to_address, now),
+            )
+            conn.commit()
+        return {"ok": True, "msg": f"Faucet enviou {FAUCET_AMOUNT} BRN.", "tx": tx}
+
+    # ---------------- Carga do disco ----------------
     def _load_from_db(self) -> bool:
         try:
             with sqlite3.connect(self.db_path) as conn:
-                rows = conn.execute(
-                    "SELECT data FROM blocks ORDER BY idx ASC"
-                ).fetchall()
+                rows = conn.execute("SELECT data FROM blocks ORDER BY idx ASC").fetchall()
         except sqlite3.Error as e:
             print(f"[chain] erro lendo DB: {e}")
             return False
@@ -231,19 +375,31 @@ class Blockchain:
             print("[chain] cadeia em disco INVÁLIDA — recriando gênese.")
             self.chain = []
             self._replace_all_in_db([])
+            self._mempool_clear()
             return False
 
+        self._load_slashed()
         self._rebuild_state()
+        self._mempool_load()
         return True
 
     def _rebuild_state(self):
         self.state = State()
+        # Alocações iniciais (determinísticas)
+        for addr, amt in self.genesis_allocations.items():
+            self.state.credit(addr, amt)
+        # Aplica blocos
         for blk in self.chain[1:]:
             for tx in blk.transactions:
                 self.state.apply_transaction(tx)
             self.state.credit(blk.validator, BLOCK_REWARD)
+        # Reaplica slashing (zera saldo de banidos)
+        for v in self.slashed:
+            if v in self.state.balances:
+                self.state.balances[v] = 0.0
+            self.state.nonces[v] = self.state.nonce(v) + 1
 
-    # ---------- Gênese ----------
+    # ---------------- Gênese ----------------
     def _create_genesis(self):
         genesis = Block(
             index=0,
@@ -259,13 +415,15 @@ class Blockchain:
     def last_block(self) -> Block:
         return self.chain[-1]
 
-    # ---------- Mempool ----------
+    # ---------------- Mempool (adição) ----------------
     def add_transaction(self, tx: dict) -> dict:
         with self.lock:
             if not Transaction.verify_signature(tx):
                 return {"ok": False, "msg": "Assinatura inválida."}
             if Transaction.derived_address(tx) != tx["from"]:
                 return {"ok": False, "msg": "Endereço não corresponde à chave pública."}
+            if tx["from"] in self.slashed:
+                return {"ok": False, "msg": "Remetente está banido (slashing)."}
             if self.state.balance(tx["from"]) < tx["amount"]:
                 return {"ok": False, "msg": "Saldo insuficiente."}
             if tx["nonce"] != self.state.nonce(tx["from"]):
@@ -274,14 +432,17 @@ class Blockchain:
                 if p["from"] == tx["from"] and p["nonce"] == tx["nonce"]:
                     return {"ok": False, "msg": "Duplicada na mempool."}
             self.pending.append(tx)
+            self._mempool_add(tx)
             return {"ok": True, "msg": "Transação aceita."}
 
-    # ---------- Seleção do validador (PoS por peso) ----------
+    # ---------------- Seleção de validador (PoS) ----------------
     def _select_validator(self) -> Optional[str]:
-        eligible = {a: b for a, b in self.state.balances.items() if b >= MIN_STAKE}
+        eligible = {
+            a: b for a, b in self.state.balances.items()
+            if b >= MIN_STAKE and a not in self.slashed
+        }
         if not eligible:
-            # fallback: permite que o próprio nó produza (bootstrap)
-            if self.node_identity:
+            if self.node_identity and self.node_identity["address"] not in self.slashed:
                 return self.node_identity["address"]
             return None
         total = sum(eligible.values())
@@ -293,19 +454,19 @@ class Blockchain:
                 return addr
         return list(eligible.keys())[-1]
 
-    # ---------- Produção de bloco ----------
+    # ---------------- Produção de bloco ----------------
     def produce_block(self) -> Optional[Block]:
         with self.lock:
             if not self.node_identity:
                 return None
+            if self.node_identity["address"] in self.slashed:
+                print("[consenso] este nó está banido (slashing); não produz blocos.")
+                return None
 
             validator = self._select_validator()
-
-            # Só produz se fui escolhido (ou bootstrap com fallback acima)
             if validator != self.node_identity["address"]:
                 return None
 
-            # Aplica transações sobre estado temporário
             temp = State()
             temp.balances = dict(self.state.balances)
             temp.nonces = dict(self.state.nonces)
@@ -330,37 +491,45 @@ class Blockchain:
                 print("[consenso] bloco produzido NÃO passou na própria verificação.")
                 return None
 
-            # Aplica de verdade
             for tx in chosen:
                 self.state.apply_transaction(tx)
+                self._mempool_remove(tx)
             self.state.credit(block.validator, BLOCK_REWARD)
 
             self.pending = [t for t in self.pending if t not in chosen]
             self.chain.append(block)
             self._persist_block(block)
-
             return block
 
-    # ---------- Verificação da cadeia completa ----------
-    def _verify_chain_structure(self, chain: List[Block]) -> bool:
-        if not chain:
-            return False
+    # ---------------- Verificação de estrutura ----------------
+    def _find_invalid_block(self, chain: List[Block]) -> Optional[Block]:
+        """Retorna o primeiro bloco inválido (assinatura/hash), se houver."""
         for i, blk in enumerate(chain):
             if not blk.verify():
-                print(f"[chain] bloco #{blk.index} com assinatura/hash inválido.")
-                return False
+                return blk
             if i == 0:
                 continue
             prev = chain[i - 1]
-            if blk.previous_hash != prev.hash:
-                print(f"[chain] bloco #{blk.index} com previous_hash divergente.")
-                return False
-            if blk.index != prev.index + 1:
-                print(f"[chain] índice fora de sequência em #{blk.index}.")
-                return False
-        return True
+            if blk.previous_hash != prev.hash or blk.index != prev.index + 1:
+                return blk
+        return None
 
-    # ---------- Substituir cadeia (com validação por bloco) ----------
+    def _verify_chain_structure(self, chain: List[Block]) -> bool:
+        return self._find_invalid_block(chain) is None
+
+    # ---------------- Fork-choice (GHOST simplificado) ----------------
+    def _fork_score(self, chain: List[Block]) -> float:
+        """
+        Peso = Σ (1 + saldo_atual_do_validador) para cada bloco após gênese.
+        Isso dá preferência a cadeias validadas por nós com mais stake.
+        Empate → vence a mais longa (desempate natural no replace_chain).
+        """
+        score = 0.0
+        for blk in chain[1:]:
+            score += 1.0 + self.state.balance(blk.validator)
+        return score
+
+    # ---------------- Substituição de cadeia ----------------
     def replace_chain(self, new_chain: List[dict]) -> bool:
         try:
             blocks = [Block.from_dict(b) if isinstance(b, dict) else b for b in new_chain]
@@ -369,35 +538,71 @@ class Blockchain:
             return False
 
         with self.lock:
-            if len(blocks) <= len(self.chain):
-                return False
-            if not self._verify_chain_structure(blocks):
-                print("[chain] cadeia recebida rejeitada: assinatura/hash inválido.")
+            # Detecta e pune bloco inválido
+            invalid = self._find_invalid_block(blocks)
+            if invalid is not None:
+                self._slash(
+                    invalid.validator,
+                    f"bloco inválido #{invalid.index} (hash/assinatura)",
+                    block_idx=invalid.index,
+                )
                 return False
 
-            # reconstrói estado (determinístico)
+            # Fork-choice: só aceita se tiver score maior; empate → mais longa
+            new_score = self._fork_score(blocks)
+            cur_score = self._fork_score(self.chain)
+            if new_score < cur_score:
+                return False
+            if new_score == cur_score and len(blocks) <= len(self.chain):
+                return False
+
+            # Reconstrói estado
             new_state = State()
+            for addr, amt in self.genesis_allocations.items():
+                new_state.credit(addr, amt)
             for blk in blocks[1:]:
                 for tx in blk.transactions:
                     if not Transaction.verify_signature(tx):
-                        print(f"[chain] tx inválida no bloco #{blk.index}")
+                        print(f"[chain] tx inválida no bloco #{blk.index}; rejeitando.")
                         return False
                     if not new_state.apply_transaction(tx):
-                        print(f"[chain] tx rejeitada no bloco #{blk.index}")
+                        print(f"[chain] tx rejeitada no bloco #{blk.index}; rejeitando.")
                         return False
                 new_state.credit(blk.validator, BLOCK_REWARD)
+            for v in self.slashed:
+                if v in new_state.balances:
+                    new_state.balances[v] = 0.0
+                new_state.nonces[v] = new_state.nonce(v) + 1
 
             self.chain = blocks
             self.state = new_state
-            self.pending = []
+            # Mempool: remove txs que já estão na nova cadeia
+            confirmed = {Transaction.hash(tx) for blk in blocks for tx in blk.transactions}
+            self.pending = [t for t in self.pending if Transaction.hash(t) not in confirmed]
             self._replace_all_in_db(blocks)
-            print(f"[chain] cadeia substituída → altura {len(blocks)}")
+            self._mempool_clear()
+            for t in self.pending:
+                self._mempool_add(t)
+
+            print(f"[chain] cadeia substituída → altura {len(blocks)} "
+                  f"(score {new_score:.1f})")
             return True
 
-    # ---------- Serialização ----------
+    # ---------------- Serialização ----------------
     def to_dict(self) -> dict:
         return {
             "network_id": NETWORK_ID,
             "length": len(self.chain),
             "chain": [b.to_dict() for b in self.chain],
         }
+
+    def slashing_report(self) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT validator, reason, block_idx, ts FROM slashing ORDER BY ts DESC"
+            ).fetchall()
+        return [
+            {"validator": r[0], "reason": r[1], "block_index": r[2],
+             "timestamp": r[3]}
+            for r in rows
+        ]
