@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 run.py — setup completo em um comando.
-Requer Instal.py na mesma pasta.
+Requer instal.py na mesma pasta.
 Uso: python run.py
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ import sys
 import venv
 
 IS_WINDOWS = platform.system() == "Windows"
-INSTALLER = "Instal.py"   # ← nome do seu arquivo
+INSTALLER = "instal.py"   # nome real do arquivo (minúsculo)
 
 
 def step(msg: str) -> None:
@@ -37,7 +37,7 @@ def main() -> int:
 
     # 1. Gera o projeto
     step(f"Rodando {INSTALLER}")
-    run([sys.executable, INSTALLER])
+    run([sys.executable, str(installer)])
 
     project = here / "brn-prod"
     if not project.exists():
@@ -118,9 +118,21 @@ def main() -> int:
         print(f"  bloco {i+1}/3…")
         run([py_str, "-m", "brn.cli", "mine", addr])
 
-    # 9. subir nó + explorador
+    # 9. pré-cria o token de API antes de exibir (o nó também cria,
+    #    mas só depois de subir — precisamos dele agora)
+    step("Preparando token da API")
+    data_dir = pathlib.Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    tok_file = data_dir / ".api_token"
+    if not tok_file.exists():
+        tok_file.write_text(secrets.token_urlsafe(32))
+        if not IS_WINDOWS:
+            os.chmod(tok_file, 0o600)
+    api_token = tok_file.read_text().strip()
+    print(f"  token salvo em {tok_file}")
+
+    # 10. subir nó + explorador
     step("Subindo nó + explorador")
-    api_token = pathlib.Path("data/.api_token").read_text().strip()
     print(f"\n  API token: {api_token}")
     print("  Home:  http://127.0.0.1:8080/")
     print("  API:   http://127.0.0.1:8080/api/status")

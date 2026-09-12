@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-install_brn.py — instalador completo do BRN Produção v3.
+instal.py — instalador completo do BRN Produção v3.
 Gera o projeto brn-prod/ com: explorador, NGROK seguro, HD wallet,
 P2P autenticado, checkpoints, métricas, Docker, CI.
-Uso: python install_brn.py [destino]
+Uso: python instal.py [destino]
 """
 from __future__ import annotations
 import sys
@@ -1186,10 +1186,17 @@ def create_app(cfg: Settings, chain: Blockchain, api_token: SecureToken,
             f"<td>{t.get('from_address','—')[:16]}…</td>"
             f"<td>{sum(o['amount'] for o in t.get('outputs',[])) if t.get('outputs') else 0}</td></tr>"
             for t in b.get("txs", []))
-        return f"<html><body style='font-family:system-ui;background:#0d1117;color:#e6edf3;padding:24px'>"
-        f"<h1>Bloco #{h}</h1><p>Hash: <code>{row['hash']}</code></p>"
-        f"<table style='width:100%'><tr><th>TXID</th><th>De</th><th>Valor</th></tr>{rows}</table>"
-        f"<p><a href='/' style='color:#58a6ff'>← Voltar</a></p></body></html>"
+        html = (
+            "<html><body style='font-family:system-ui;background:#0d1117;"
+            "color:#e6edf3;padding:24px'>"
+            f"<h1>Bloco #{h}</h1><p>Hash: <code>{row['hash']}</code></p>"
+            "<table style='width:100%'><tr>"
+            "<th>TXID</th><th>De</th><th>Valor</th></tr>"
+            f"{rows}</table>"
+            "<p><a href='/' style='color:#58a6ff'>&larr; Voltar</a></p>"
+            "</body></html>"
+        )
+        return html
 
     @app.get("/health")
     @limiter.exempt
@@ -1816,3 +1823,4 @@ chmod 600 .env
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 make ci
+python -m brn.cli node --with-explorer
