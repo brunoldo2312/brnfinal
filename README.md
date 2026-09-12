@@ -1,3 +1,35 @@
+🧪 Como testar (dois nós, mesma máquina)
+
+Terminal A — nó 1
+
+```bash
+export NGROK_AUTHTOKEN="SEU_TOKEN_NOVO"
+export BRN_P2P_PORT=7777
+export BRN_WEB_PORT=5000
+export BRN_DB_PATH=node1.db
+export BRN_IDENTITY_FILE=node1_identity.json
+python node.py
+```
+
+Terminal B — nó 2 (aponta para o nó 1)
+
+```bash
+export BRN_P2P_PORT=7778
+export BRN_WEB_PORT=5001
+export BRN_DB_PATH=node2.db
+export BRN_IDENTITY_FILE=node2_identity.json
+export BRN_SEED_PEERS=127.0.0.1:7777
+python node.py
+```
+
+O que observar
+
+· No nó 1, o loop de consenso assina o bloco com a chave de node1_identity.json.
+· No nó 2, ao receber a mensagem chain, o replace_chain valida cada bloco:
+  · hash == calculate_hash()
+  · validator == address_from_public_key(validator_public_key)
+  · verify_signature(pubkey, {"block_hash", "index"}, signature)
+
 # 1) Instalar dependências
 pip install -r requirements.txt
 
