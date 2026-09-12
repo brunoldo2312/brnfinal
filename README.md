@@ -1,3 +1,11 @@
+# 1) Instalar dependências
+pip install -r requirements.txt
+
+# 2) Testar carteira
+python main.py
+
+# 3) Subir nó (em outra máquina ou terminal)
+BRN_P2P_PORT=7777 python node.py
 ✅ O que você precisa fazer
 Você ainda não baixou o projeto. Precisa clonar primeiro. Siga exatamente estes comandos, um de cada vez:
 
