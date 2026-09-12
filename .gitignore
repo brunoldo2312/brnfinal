@@ -1,22 +1,32 @@
+# Segredos
+.env
+*.env
+node*_identity.json
+node*_faucet.json
+*_identity.json
+*_faucet.json
+
+# Bancos de dados
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Carteiras
+wallets/
+*.wallet
+
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-env/
+venv/
+.pytest_cache/
 
-# Dados do nó (cadeia + mempool)
-blockchain_node_*.db
-mempool_node_*.json
+# Logs
+*.log
 
-# Carteiras (nunca versionar chaves)
-wallets/
-
-# Build / PyInstaller
-build/
-dist/
-*.spec.bak
-
-# SO
-.DS_Store
-Thumbs.db
+# IDE
+.vscode/
+.idea/
