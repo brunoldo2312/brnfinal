@@ -2,8 +2,9 @@
 # Blockchain com:
 #   - SHA3-256, blocos assinados por ECDSA
 #   - Persistência SQLite (cadeia, mempool, slashing, faucet)
-#   - Slashing de validadores maliciosos
+#   - Slashing com evidência assinada
 #   - Fork-choice estilo GHOST (peso por stake)
+#   - Finality gadget (Casper FFG simplificado)
 #   - Faucet de bootstrap
 
 import hashlib
@@ -19,16 +20,22 @@ from typing import List, Dict, Optional, Set, Tuple
 from cripto_wallet import WalletManager
 
 NETWORK_ID = os.environ.get("BRN_NETWORK_ID", "brn-mainnet-1")
+P2P_HOST = os.environ.get("BRN_P2P_HOST", "0.0.0.0")
+P2P_PORT = int(os.environ.get("BRN_P2P_PORT", "7777"))
+SEED_PEERS = [p.strip() for p in os.environ.get("BRN_SEED_PEERS", "").split(",") if p.strip()]
+TARGET_BLOCK_TIME = int(os.environ.get("BRN_TARGET_BLOCK_TIME", "10"))
+
 BLOCK_REWARD = float(os.environ.get("BRN_BLOCK_REWARD", "50"))
 MIN_STAKE = float(os.environ.get("BRN_MIN_STAKE", "100"))
 DB_PATH = os.environ.get("BRN_DB_PATH", "blockchain.db")
 
-# Faucet
+FINALITY_INTERVAL = int(os.environ.get("BRN_FINALITY_INTERVAL", "5"))
+FINALITY_THRESHOLD = float(os.environ.get("BRN_FINALITY_THRESHOLD", "0.67"))
+
 FAUCET_ADDRESS = os.environ.get("BRN_FAUCET_ADDRESS", "").strip()
 FAUCET_AMOUNT = float(os.environ.get("BRN_FAUCET_AMOUNT", "100"))
-FAUCET_COOLDOWN = int(os.environ.get("BRN_FAUCET_COOLDOWN", "3600"))  # segundos
+FAUCET_COOLDOWN = int(os.environ.get("BRN_FAUCET_COOLDOWN", "3600"))
 
-# Alocação inicial: "endereco1:1000000,endereco2:500000"
 _raw_alloc = os.environ.get("BRN_GENESIS_ALLOC", "").strip()
 GENESIS_ALLOCATIONS: Dict[str, float] = {}
 if _raw_alloc:
@@ -41,9 +48,9 @@ if _raw_alloc:
                 pass
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Bloco
-# ------------------------------------------------------------------
+# ==================================================================
 @dataclass
 class Block:
     index: int
@@ -102,9 +109,9 @@ class Block:
         return cls(**d)
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Transações
-# ------------------------------------------------------------------
+# ==================================================================
 class Transaction:
     REQUIRED_FIELDS = {"from", "to", "amount", "nonce", "public_key", "signature"}
 
@@ -143,9 +150,9 @@ class Transaction:
         return hashlib.sha3_256(raw).hexdigest()
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Estado
-# ------------------------------------------------------------------
+# ==================================================================
 class State:
     def __init__(self):
         self.balances: Dict[str, float] = {}
@@ -175,9 +182,136 @@ class State:
         return True
 
 
-# ------------------------------------------------------------------
+# ==================================================================
+# Finality gadget (Casper FFG simplificado)
+# ==================================================================
+class Finality:
+    """
+    Checkpoints a cada FINALITY_INTERVAL blocos.
+    Um checkpoint é finalizado quando > FINALITY_THRESHOLD do stake vota nele.
+    Blocos finalizados não podem ser revertidos.
+    """
+
+    def __init__(self, interval: int = FINALITY_INTERVAL,
+                 threshold: float = FINALITY_THRESHOLD):
+        self.interval = interval
+        self.threshold = threshold
+        self.finalized_height: int = -1
+        self.votes: Dict[int, Set[str]] = {}  # altura → validadores
+
+    def is_checkpoint(self, height: int) -> bool:
+        return height > 0 and height % self.interval == 0
+
+    def vote(self, height: int, validator: str) -> bool:
+        """Registra voto. Retorna True se o checkpoint foi finalizado."""
+        if not self.is_checkpoint(height):
+            return False
+        self.votes.setdefault(height, set()).add(validator)
+        return False
+
+    def try_finalize(self, height: int, stakes: Dict[str, float]) -> bool:
+        """Finaliza se stake votante >= threshold * stake total."""
+        if height <= self.finalized_height:
+            return False
+        if not self.is_checkpoint(height):
+            return False
+        voted = self.votes.get(height, set())
+        total_stake = sum(stakes.values())
+        if total_stake <= 0:
+            return False
+        voted_stake = sum(stakes.get(v, 0.0) for v in voted)
+        if voted_stake >= self.threshold * total_stake:
+            self.finalized_height = height
+            print(f"[finality] checkpoint #{height} FINALIZADO "
+                  f"({voted_stake:.1f}/{total_stake:.1f} stake)")
+            return True
+        return False
+
+    def to_dict(self) -> dict:
+        return {
+            "interval": self.interval,
+            "threshold": self.threshold,
+            "finalized_height": self.finalized_height,
+            "votes": {str(k): list(v) for k, v in self.votes.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Finality":
+        f = cls(d.get("interval", FINALITY_INTERVAL),
+                d.get("threshold", FINALITY_THRESHOLD))
+        f.finalized_height = d.get("finalized_height", -1)
+        f.votes = {int(k): set(v) for k, v in d.get("votes", {}).items()}
+        return f
+
+
+# ==================================================================
+# Slashing com evidência assinada
+# ==================================================================
+@dataclass
+class SlashingEvidence:
+    validator: str
+    reason: str
+    block_index: int
+    invalid_block: dict
+    reporter: str
+    reporter_public_key: str
+    reporter_signature: str
+
+    def canonical(self) -> dict:
+        return {
+            "validator": self.validator,
+            "reason": self.reason,
+            "block_index": self.block_index,
+            "block_hash": self.invalid_block.get("hash", ""),
+            "reporter": self.reporter,
+        }
+
+    def verify(self) -> bool:
+        """Valida a evidência: bloco realmente inválido + assinatura do reporter."""
+        try:
+            blk = Block.from_dict(self.invalid_block)
+        except Exception:
+            return False
+        if blk.verify():
+            return False  # bloco é válido → evidência falsa
+        if self.validator != blk.validator:
+            return False
+        if self.block_index != blk.index:
+            return False
+        derived = WalletManager.address_from_public_key(self.reporter_public_key)
+        if derived != self.reporter:
+            return False
+        return WalletManager.verify_signature(
+            self.reporter_public_key, self.canonical(), self.reporter_signature
+        )
+
+    @staticmethod
+    def build(invalid_block: Block, reason: str,
+              reporter_sk: str, reporter_pk: str) -> "SlashingEvidence":
+        reporter_addr = WalletManager.address_from_public_key(reporter_pk)
+        ev = SlashingEvidence(
+            validator=invalid_block.validator,
+            reason=reason,
+            block_index=invalid_block.index,
+            invalid_block=invalid_block.to_dict(),
+            reporter=reporter_addr,
+            reporter_public_key=reporter_pk,
+            reporter_signature="",
+        )
+        ev.reporter_signature = WalletManager.sign_transaction(reporter_sk, ev.canonical())
+        return ev
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SlashingEvidence":
+        return cls(**d)
+
+
+# ==================================================================
 # Blockchain
-# ------------------------------------------------------------------
+# ==================================================================
 class Blockchain:
     def __init__(self, db_path: str = DB_PATH, node_identity: Optional[dict] = None,
                  genesis_allocations: Optional[Dict[str, float]] = None):
@@ -189,6 +323,7 @@ class Blockchain:
         self.pending: List[dict] = []
         self.state = State()
         self.slashed: Set[str] = set()
+        self.finality = Finality()
         self.lock = threading.RLock()
 
         self._init_db()
@@ -205,35 +340,37 @@ class Blockchain:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS blocks (
-                    idx       INTEGER PRIMARY KEY,
-                    hash      TEXT NOT NULL,
+                    idx INTEGER PRIMARY KEY,
+                    hash TEXT NOT NULL,
                     validator TEXT,
                     timestamp REAL,
-                    data      TEXT NOT NULL
-                )
-            """)
+                    data TEXT NOT NULL
+                )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON blocks(hash)")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS mempool (
-                    tx_hash   TEXT PRIMARY KEY,
-                    ts        REAL NOT NULL,
-                    data      TEXT NOT NULL
-                )
-            """)
+                    tx_hash TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    data TEXT NOT NULL
+                )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS slashing (
                     validator TEXT PRIMARY KEY,
-                    reason    TEXT,
+                    reason TEXT,
                     block_idx INTEGER,
-                    ts        REAL
-                )
-            """)
+                    ts REAL,
+                    evidence TEXT
+                )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS faucet_claims (
-                    address    TEXT PRIMARY KEY,
+                    address TEXT PRIMARY KEY,
                     last_claim REAL NOT NULL
-                )
-            """)
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS finality (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    data TEXT NOT NULL
+                )""")
             conn.commit()
 
     def _persist_block(self, block: Block):
@@ -245,6 +382,24 @@ class Blockchain:
                  block.timestamp, json.dumps(block.to_dict())),
             )
             conn.commit()
+
+    def _persist_finality(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO finality (id, data) VALUES (1, ?)",
+                (json.dumps(self.finality.to_dict()),),
+            )
+            conn.commit()
+
+    def _load_finality(self):
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT data FROM finality WHERE id = 1").fetchone()
+        if row:
+            try:
+                self.finality = Finality.from_dict(json.loads(row[0]))
+                print(f"[finality] checkpoint finalizado = #{self.finality.finalized_height}")
+            except Exception:
+                pass
 
     def _replace_all_in_db(self, blocks: List[Block]):
         with sqlite3.connect(self.db_path) as conn:
@@ -258,7 +413,7 @@ class Blockchain:
                 )
             conn.commit()
 
-    # ---------------- Mempool persistente ----------------
+    # ---------------- Mempool ----------------
     def _mempool_add(self, tx: dict):
         txh = Transaction.hash(tx)
         with sqlite3.connect(self.db_path) as conn:
@@ -301,31 +456,45 @@ class Blockchain:
         if self.slashed:
             print(f"[slashing] {len(self.slashed)} validador(es) banido(s) carregado(s).")
 
-    def _slash(self, validator: str, reason: str, block_idx: int = -1):
+    def _slash(self, validator: str, reason: str, block_idx: int = -1,
+               evidence: Optional[SlashingEvidence] = None):
+        """Aplica slashing. Se evidence é fornecida, valida primeiro."""
+        if evidence is not None:
+            if not evidence.verify():
+                print("[slash] evidência inválida — ignorando.")
+                return False
         if not validator or validator == "genesis":
-            return
+            return False
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO slashing (validator, reason, block_idx, ts) "
-                "VALUES (?, ?, ?, ?)",
-                (validator, reason, block_idx, time.time()),
+                "INSERT OR REPLACE INTO slashing (validator, reason, block_idx, ts, evidence) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (validator, reason, block_idx, time.time(),
+                 json.dumps(evidence.to_dict()) if evidence else None),
             )
             conn.commit()
         self.slashed.add(validator)
-        # Efeito imediato: zera saldo e incrementa nonce
         if validator in self.state.balances:
             self.state.balances[validator] = 0.0
         self.state.nonces[validator] = self.state.nonce(validator) + 1
         print(f"[slash] validador {validator[:16]}… banido ({reason})")
+        return True
+
+    def submit_slashing_evidence(self, evidence: SlashingEvidence) -> bool:
+        """Qualquer nó pode submeter evidência; todos aplicam se válida."""
+        if not evidence.verify():
+            return False
+        return self._slash(evidence.validator, evidence.reason,
+                           evidence.block_index, evidence)
 
     # ---------------- Faucet ----------------
-    def faucet(self, to_address: str, private_key_hex: str, public_key_hex: str) -> dict:
+    def faucet(self, to_address: str, private_key_hex: str,
+               public_key_hex: str) -> dict:
         if not FAUCET_ADDRESS:
             return {"ok": False, "msg": "Faucet desativado nesta rede."}
         if FAUCET_ADDRESS != WalletManager.address_from_public_key(public_key_hex):
             return {"ok": False, "msg": "Chave do faucet não corresponde."}
 
-        # Cooldown
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
@@ -336,7 +505,6 @@ class Blockchain:
             remaining = int(FAUCET_COOLDOWN - (now - row[0]))
             return {"ok": False, "msg": f"Aguarde {remaining}s para pedir novamente."}
 
-        # Monta tx do faucet → destinatário
         tx = Transaction.build(
             sender_address=FAUCET_ADDRESS,
             receiver_address=to_address,
@@ -351,7 +519,8 @@ class Blockchain:
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO faucet_claims (address, last_claim) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO faucet_claims (address, last_claim) "
+                "VALUES (?, ?)",
                 (to_address, now),
             )
             conn.commit()
@@ -379,34 +548,28 @@ class Blockchain:
             return False
 
         self._load_slashed()
+        self._load_finality()
         self._rebuild_state()
         self._mempool_load()
         return True
 
     def _rebuild_state(self):
         self.state = State()
-        # Alocações iniciais (determinísticas)
         for addr, amt in self.genesis_allocations.items():
             self.state.credit(addr, amt)
-        # Aplica blocos
         for blk in self.chain[1:]:
             for tx in blk.transactions:
                 self.state.apply_transaction(tx)
             self.state.credit(blk.validator, BLOCK_REWARD)
-        # Reaplica slashing (zera saldo de banidos)
         for v in self.slashed:
             if v in self.state.balances:
                 self.state.balances[v] = 0.0
             self.state.nonces[v] = self.state.nonce(v) + 1
 
-    # ---------------- Gênese ----------------
     def _create_genesis(self):
         genesis = Block(
-            index=0,
-            timestamp=time.time(),
-            previous_hash="0" * 64,
-            transactions=[],
-            validator="genesis",
+            index=0, timestamp=time.time(), previous_hash="0" * 64,
+            transactions=[], validator="genesis",
         )
         genesis.finalize()
         self.chain.append(genesis)
@@ -415,7 +578,7 @@ class Blockchain:
     def last_block(self) -> Block:
         return self.chain[-1]
 
-    # ---------------- Mempool (adição) ----------------
+    # ---------------- Mempool ----------------
     def add_transaction(self, tx: dict) -> dict:
         with self.lock:
             if not Transaction.verify_signature(tx):
@@ -435,7 +598,7 @@ class Blockchain:
             self._mempool_add(tx)
             return {"ok": True, "msg": "Transação aceita."}
 
-    # ---------------- Seleção de validador (PoS) ----------------
+    # ---------------- Seleção de validador ----------------
     def _select_validator(self) -> Optional[str]:
         eligible = {
             a: b for a, b in self.state.balances.items()
@@ -499,11 +662,17 @@ class Blockchain:
             self.pending = [t for t in self.pending if t not in chosen]
             self.chain.append(block)
             self._persist_block(block)
+
+            # Registra voto do próprio nó (se checkpoint)
+            if self.finality.is_checkpoint(block.index):
+                self.finality.vote(block.index, block.validator)
+                if self.finality.try_finalize(block.index, self.state.balances):
+                    self._persist_finality()
+
             return block
 
-    # ---------------- Verificação de estrutura ----------------
+    # ---------------- Verificação ----------------
     def _find_invalid_block(self, chain: List[Block]) -> Optional[Block]:
-        """Retorna o primeiro bloco inválido (assinatura/hash), se houver."""
         for i, blk in enumerate(chain):
             if not blk.verify():
                 return blk
@@ -517,13 +686,7 @@ class Blockchain:
     def _verify_chain_structure(self, chain: List[Block]) -> bool:
         return self._find_invalid_block(chain) is None
 
-    # ---------------- Fork-choice (GHOST simplificado) ----------------
     def _fork_score(self, chain: List[Block]) -> float:
-        """
-        Peso = Σ (1 + saldo_atual_do_validador) para cada bloco após gênese.
-        Isso dá preferência a cadeias validadas por nós com mais stake.
-        Empate → vence a mais longa (desempate natural no replace_chain).
-        """
         score = 0.0
         for blk in chain[1:]:
             score += 1.0 + self.state.balance(blk.validator)
@@ -532,12 +695,27 @@ class Blockchain:
     # ---------------- Substituição de cadeia ----------------
     def replace_chain(self, new_chain: List[dict]) -> bool:
         try:
-            blocks = [Block.from_dict(b) if isinstance(b, dict) else b for b in new_chain]
+            blocks = [Block.from_dict(b) if isinstance(b, dict) else b
+                      for b in new_chain]
         except Exception as e:
             print(f"[chain] erro ao desserializar cadeia recebida: {e}")
             return False
 
         with self.lock:
+            # Rejeita se não contém bloco finalizado
+            if len(blocks) <= self.finality.finalized_height:
+                print("[chain] cadeia não contém checkpoint finalizado; rejeitando.")
+                return False
+
+            # Rejeita se remove bloco já finalizado
+            for i in range(min(self.finality.finalized_height + 1, len(self.chain))):
+                if i >= len(blocks):
+                    print("[chain] cadeia perde bloco finalizado; rejeitando.")
+                    return False
+                if blocks[i].hash != self.chain[i].hash:
+                    print(f"[chain] cadeia conflita com bloco finalizado #{i}; rejeitando.")
+                    return False
+
             # Detecta e pune bloco inválido
             invalid = self._find_invalid_block(blocks)
             if invalid is not None:
@@ -548,7 +726,6 @@ class Blockchain:
                 )
                 return False
 
-            # Fork-choice: só aceita se tiver score maior; empate → mais longa
             new_score = self._fork_score(blocks)
             cur_score = self._fork_score(self.chain)
             if new_score < cur_score:
@@ -556,17 +733,14 @@ class Blockchain:
             if new_score == cur_score and len(blocks) <= len(self.chain):
                 return False
 
-            # Reconstrói estado
             new_state = State()
             for addr, amt in self.genesis_allocations.items():
                 new_state.credit(addr, amt)
             for blk in blocks[1:]:
                 for tx in blk.transactions:
                     if not Transaction.verify_signature(tx):
-                        print(f"[chain] tx inválida no bloco #{blk.index}; rejeitando.")
                         return False
                     if not new_state.apply_transaction(tx):
-                        print(f"[chain] tx rejeitada no bloco #{blk.index}; rejeitando.")
                         return False
                 new_state.credit(blk.validator, BLOCK_REWARD)
             for v in self.slashed:
@@ -576,9 +750,9 @@ class Blockchain:
 
             self.chain = blocks
             self.state = new_state
-            # Mempool: remove txs que já estão na nova cadeia
             confirmed = {Transaction.hash(tx) for blk in blocks for tx in blk.transactions}
-            self.pending = [t for t in self.pending if Transaction.hash(t) not in confirmed]
+            self.pending = [t for t in self.pending
+                            if Transaction.hash(t) not in confirmed]
             self._replace_all_in_db(blocks)
             self._mempool_clear()
             for t in self.pending:
@@ -599,10 +773,19 @@ class Blockchain:
     def slashing_report(self) -> List[dict]:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT validator, reason, block_idx, ts FROM slashing ORDER BY ts DESC"
+                "SELECT validator, reason, block_idx, ts, evidence "
+                "FROM slashing ORDER BY ts DESC"
             ).fetchall()
         return [
             {"validator": r[0], "reason": r[1], "block_index": r[2],
-             "timestamp": r[3]}
+             "timestamp": r[3], "evidence": json.loads(r[4]) if r[4] else None}
             for r in rows
         ]
+
+    def finality_report(self) -> dict:
+        return {
+            "finalized_height": self.finality.finalized_height,
+            "interval": self.finality.interval,
+            "threshold": self.finality.threshold,
+            "checkpoint_pending": self.finality.votes,
+        }
