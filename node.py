@@ -1,6 +1,4 @@
-# node.py
-# Nó P2P: escuta UDP, propaga blocos/transações, roda loop PoS
-# e inicia o dashboard web (Flask + ngrok) para visualização.
+# node.py — Nó P2P com chaves cifradas, finality, slashing assinado.
 
 import json
 import socket
@@ -8,29 +6,78 @@ import threading
 import time
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Carrega variáveis de ambiente do .env (se existir)
 load_dotenv()
 
 from bruno_blockchain_real import (
-    Blockchain,
-    Block,
-    NETWORK_ID,
-    P2P_HOST,
-    P2P_PORT,
-    SEED_PEERS,
-    TARGET_BLOCK_TIME,
+    Blockchain, Block, NETWORK_ID, P2P_HOST, P2P_PORT, SEED_PEERS,
+    TARGET_BLOCK_TIME, FAUCET_ADDRESS, GENESIS_ALLOCATIONS,
+    SlashingEvidence,
 )
-from web_server import start_web_server
+from cripto_wallet import WalletManager
+from web_server import start_web_server, set_faucet_handler
+
+IDENTITY_FILE = os.environ.get("BRN_IDENTITY_FILE", "node_identity.wallet")
+FAUCET_KEY_FILE = os.environ.get("BRN_FAUCET_KEY_FILE", "faucet_identity.wallet")
+MASTER_PASSWORD = os.environ.get("BRN_MASTER_PASSWORD", "")
+
+if len(MASTER_PASSWORD) < 20:
+    print("[ERRO] BRN_MASTER_PASSWORD deve ter >= 20 caracteres. Configure no .env.")
+    sys.exit(1)
+
+
+def load_or_create_identity(path_str: str, label: str) -> dict:
+    """Carrega identidade cifrada ou cria uma nova (AES-256-GCM + Argon2id)."""
+    path = Path(path_str)
+    if not path.suffix == ".wallet":
+        path = path.with_suffix(".wallet")
+
+    if path.exists():
+        r = WalletManager.load_encrypted_wallet(str(path), MASTER_PASSWORD)
+        if r["status"] != "sucesso":
+            print(f"[{label}] FALHA ao decifrar: {r['message']}")
+            sys.exit(1)
+        print(f"[{label}] carregada: {r['address'][:20]}…")
+        return {
+            "address": r["address"],
+            "spend_secret_key": r["spend_secret_key"],
+            "public_key": r["public_key"],
+        }
+
+    # Gera nova identidade
+    data = WalletManager.generate_keypair()
+    r = WalletManager.save_encrypted_wallet(
+        str(path), MASTER_PASSWORD,
+        data["address"], data["spend_secret_key"], data["public_key"],
+    )
+    if r["status"] != "sucesso":
+        print(f"[{label}] FALHA ao salvar: {r['message']}")
+        sys.exit(1)
+    print(f"[{label}] nova identidade gerada: {data['address'][:20]}…")
+    return data
 
 
 class Node:
     def __init__(self):
-        # ---------- Blockchain ----------
-        self.bc = Blockchain()
+        self.identity = load_or_create_identity(IDENTITY_FILE, "identidade")
+        self.faucet_identity = load_or_create_identity(FAUCET_KEY_FILE, "faucet")
 
-        # ---------- Rede P2P ----------
+        alloc = dict(GENESIS_ALLOCATIONS)
+        alloc.setdefault(self.faucet_identity["address"], 1_000_000.0)
+
+        # Garante FAUCET_ADDRESS
+        import bruno_blockchain_real as bbr
+        if not bbr.FAUCET_ADDRESS:
+            bbr.FAUCET_ADDRESS = self.faucet_identity["address"]
+            os.environ["BRN_FAUCET_ADDRESS"] = self.faucet_identity["address"]
+
+        self.bc = Blockchain(
+            node_identity=self.identity,
+            genesis_allocations=alloc,
+        )
+
         self.peers = set(SEED_PEERS)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -38,155 +85,146 @@ class Node:
         except OSError as e:
             print(f"[node] erro ao abrir UDP {P2P_HOST}:{P2P_PORT} -> {e}")
             sys.exit(1)
-
         self.running = True
 
-        # ---------- Dashboard web ----------
-        # start_web_server é chamado em start() para garantir que a
-        # blockchain já esteja pronta.
-
-    # ------------------------------------------------------------------
-    # Rede P2P — envio
-    # ------------------------------------------------------------------
+    # -------- Rede --------
     def broadcast(self, message: dict):
-        """Envia mensagem JSON para todos os peers conhecidos."""
         data = json.dumps(message).encode("utf-8")
         for peer in list(self.peers):
             try:
                 host, port = peer.split(":")
                 self.sock.sendto(data, (host, int(port)))
             except Exception:
-                # Peer inválido → remove
                 self.peers.discard(peer)
 
-    # ------------------------------------------------------------------
-    # Rede P2P — recebimento
-    # ------------------------------------------------------------------
     def listen(self):
-        """Loop que recebe pacotes UDP e processa mensagens."""
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65535)
                 peer = f"{addr[0]}:{addr[1]}"
-
-                # Descobre novos peers automaticamente
                 if peer not in self.peers:
                     self.peers.add(peer)
                     print(f"[p2p] novo peer: {peer}")
-
                 msg = json.loads(data.decode("utf-8"))
                 self.handle(msg, peer)
-
             except json.JSONDecodeError:
-                # Pacote inválido → ignora silenciosamente
                 continue
             except Exception as e:
-                print(f"[p2p] erro no listen: {e}")
+                print(f"[p2p] erro: {e}")
                 continue
 
-    # ------------------------------------------------------------------
-    # Tratamento de mensagens
-    # ------------------------------------------------------------------
     def handle(self, msg: dict, peer: str):
-        """Processa uma mensagem recebida de um peer."""
         if msg.get("network_id") != NETWORK_ID:
-            return  # rede diferente → ignora
-
+            return
         kind = msg.get("type")
 
-        # ----- Transação nova -----
         if kind == "tx":
             tx = msg.get("tx")
             if not tx:
                 return
-            result = self.bc.add_transaction(tx)
-            if result.get("ok"):
-                print(f"[p2p] tx aceita de {peer}: {tx.get('amount')} BRN "
-                      f"{tx.get('from','')[:10]}… → {tx.get('to','')[:10]}…")
-                # Repassa para os outros peers (gossip)
-                self.broadcast({
-                    "type": "tx",
-                    "network_id": NETWORK_ID,
-                    "tx": tx,
-                })
+            r = self.bc.add_transaction(tx)
+            if r.get("ok"):
+                print(f"[p2p] tx aceita: {tx['amount']} BRN "
+                      f"{tx['from'][:10]}… → {tx['to'][:10]}…")
+                self.broadcast({"type": "tx", "network_id": NETWORK_ID, "tx": tx})
 
-        # ----- Cadeia nova (bloco produzido por outro nó) -----
         elif kind == "chain":
             chain = msg.get("chain")
             if not chain:
                 return
             if self.bc.replace_chain(chain):
-                print(f"[p2p] cadeia atualizada via {peer} "
-                      f"(altura={len(self.bc.chain)})")
-                # Repassa para os outros peers
                 self.broadcast({
-                    "type": "chain",
-                    "network_id": NETWORK_ID,
+                    "type": "chain", "network_id": NETWORK_ID,
                     "chain": [b.to_dict() for b in self.bc.chain],
                 })
 
-        # ----- Handshake de peer (opcional) -----
-        elif kind == "hello":
-            print(f"[p2p] hello de {peer} | altura dele={msg.get('height')}")
+        elif kind == "slashing":
+            # Evidência assinada enviada por outro nó
+            ev_data = msg.get("evidence")
+            if not ev_data:
+                return
+            try:
+                ev = SlashingEvidence.from_dict(ev_data)
+                if self.bc.submit_slashing_evidence(ev):
+                    print(f"[p2p] evidência aceita: {ev.validator[:14]}… banido")
+                    self.broadcast({
+                        "type": "slashing",
+                        "network_id": NETWORK_ID,
+                        "evidence": ev.to_dict(),
+                    })
+            except Exception as e:
+                print(f"[p2p] evidência inválida: {e}")
 
-    # ------------------------------------------------------------------
-    # Loop de consenso (produção de blocos)
-    # ------------------------------------------------------------------
+        elif kind == "hello":
+            print(f"[p2p] hello de {peer} | altura={msg.get('height')}")
+
+    # -------- Consenso --------
     def consensus_loop(self):
-        """Tenta produzir um bloco a cada TARGET_BLOCK_TIME segundos."""
         while self.running:
             time.sleep(TARGET_BLOCK_TIME)
             try:
                 block = self.bc.produce_block()
                 if block:
-                    print(f"[consenso] bloco #{block.index} produzido "
-                          f"por {block.validator[:12]}… "
+                    print(f"[consenso] bloco #{block.index} "
+                          f"assinado por {block.validator[:14]}… "
                           f"({len(block.transactions)} tx)")
                     self.broadcast({
-                        "type": "chain",
-                        "network_id": NETWORK_ID,
+                        "type": "chain", "network_id": NETWORK_ID,
                         "chain": [b.to_dict() for b in self.bc.chain],
                     })
             except Exception as e:
                 print(f"[consenso] erro: {e}")
 
-    # ------------------------------------------------------------------
-    # Submissão de transação (API interna / CLI)
-    # ------------------------------------------------------------------
-    def submit_transaction(self, tx: dict):
-        """Adiciona uma transação localmente e propaga para a rede."""
-        result = self.bc.add_transaction(tx)
-        if result.get("ok"):
-            self.broadcast({
-                "type": "tx",
-                "network_id": NETWORK_ID,
-                "tx": tx,
-            })
-        return result
+    def submit_transaction(self, tx: dict) -> dict:
+        r = self.bc.add_transaction(tx)
+        if r.get("ok"):
+            self.broadcast({"type": "tx", "network_id": NETWORK_ID, "tx": tx})
+        return r
 
-    # ------------------------------------------------------------------
-    # Inicialização
-    # ------------------------------------------------------------------
+    def faucet_handler(self, to_address: str) -> dict:
+        return self.bc.faucet(
+            to_address=to_address,
+            private_key_hex=self.faucet_identity["spend_secret_key"],
+            public_key_hex=self.faucet_identity["public_key"],
+        )
+
+    # -------- Reportar bloco inválido (evidência assinada) --------
+    def report_invalid_block(self, invalid_block_dict: dict, reason: str) -> bool:
+        """Cria evidência assinada e propaga para a rede."""
+        blk = Block.from_dict(invalid_block_dict)
+        ev = SlashingEvidence.build(
+            invalid_block=blk,
+            reason=reason,
+            reporter_sk=self.identity["spend_secret_key"],
+            reporter_pk=self.identity["public_key"],
+        )
+        if not self.bc.submit_slashing_evidence(ev):
+            return False
+        self.broadcast({
+            "type": "slashing",
+            "network_id": NETWORK_ID,
+            "evidence": ev.to_dict(),
+        })
+        return True
+
+    # -------- Início --------
     def start(self):
-        """Inicia threads de rede, consenso e dashboard web."""
-        # Thread de escuta UDP
         threading.Thread(target=self.listen, daemon=True).start()
-
-        # Thread do loop de consenso PoS
         threading.Thread(target=self.consensus_loop, daemon=True).start()
-
-        # Dashboard web + ngrok (o web_server lê NGROK_AUTHTOKEN do ambiente)
+        set_faucet_handler(self.faucet_handler)
         start_web_server(self.bc)
 
-        # Info final no terminal
         print("=" * 60)
-        print(f"[node] escutando P2P em {P2P_HOST}:{P2P_PORT}")
-        print(f"[node] rede = {NETWORK_ID}")
-        print(f"[node] peers iniciais = {len(self.peers)}")
-        print(f"[node] altura da cadeia = {len(self.bc.chain)}")
+        print(f"[node] P2P      : {P2P_HOST}:{P2P_PORT}")
+        print(f"[node] rede     : {NETWORK_ID}")
+        print(f"[node] DB       : {self.bc.db_path}")
+        print(f"[node] altura   : {len(self.bc.chain)}")
+        print(f"[node] wallet   : {self.identity['address'][:20]}…")
+        print(f"[node] faucet   : {self.faucet_identity['address'][:20]}…")
+        print(f"[node] slashed  : {len(self.bc.slashed)}")
+        print(f"[node] finality : #{self.bc.finality.finalized_height}")
         print("=" * 60)
 
-        # Mantém o processo vivo
         try:
             while self.running:
                 time.sleep(1)
@@ -195,8 +233,5 @@ class Node:
             self.running = False
 
 
-# ----------------------------------------------------------------------
-# Execução direta
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     Node().start()
