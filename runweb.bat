@@ -1,0 +1,1 @@
+[Environment]::SetEnvironmentVariable("NGROK_AUTHTOKEN", "COLE_AQUI_O_TOKEN_NOVO", "User")
