@@ -1,2 +1,2 @@
 # ngrok token (BRN-Estavel)
-export NGROK_AUTHTOKEN="COLE_AQUI_O_TOKEN_NOVO"
+export NGROK_AUTHTOKEN="3J8xHeVX46aXrOZeXnKrVVFMLTr"
