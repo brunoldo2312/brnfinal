@@ -31,6 +31,11 @@ POW_TARGET_TIME        = float(os.environ.get("BRN_POW_TARGET_TIME", "10"))
 POW_MAX_ADJUST_FACTOR  = 4
 POW_MIN_DIFFICULTY     = 1
 
+# ---------- MEV protection ----------
+MEV_COMMIT_MIN_BLOCKS   = int(os.environ.get("BRN_MEV_MIN_BLOCKS", "2"))
+MEV_COMMIT_MAX_BLOCKS   = int(os.environ.get("BRN_MEV_MAX_BLOCKS", "20"))
+MEV_MAX_PENDING_COMMITS = int(os.environ.get("BRN_MEV_MAX_COMMITS", "20"))
+
 _raw = os.environ.get("BRN_GENESIS_ALLOC", "").strip()
 GENESIS_ALLOCATIONS: Dict[str, Dict[str, float]] = {}
 if _raw:
@@ -72,7 +77,8 @@ class Block:
 
     def _registry_hash(self):
         if not self.registry_snapshot: return ""
-        return hashlib.sha3_256(json.dumps(self.registry_snapshot, sort_keys=True,
+        return hashlib.sha3_256(json.dumps(self.registry_snapshot,
+                                sort_keys=True,
                                 separators=(",", ":")).encode()).hexdigest()
 
     def target(self): return "0" * self.difficulty
@@ -136,8 +142,8 @@ class Transaction:
     VALID_TYPES = {
         "transfer", "issue", "redeem", "freeze", "unfreeze",
         "kyc_register", "kyc_revoke", "asset_create", "asset_update", "dividend",
-        # CLOB
         "order_place", "order_cancel",
+        "order_commit", "order_reveal",
     }
     CANONICAL_FIELDS = {"type", "asset_id", "from", "to", "amount",
                         "nonce", "public_key", "timestamp", "metadata"}
@@ -179,7 +185,7 @@ class Transaction:
 
 
 # =====================================================================
-# State — agora com orders, order_books e trades
+# State
 # =====================================================================
 class State:
     def __init__(self):
@@ -190,8 +196,9 @@ class State:
         # CLOB
         self.orders: Dict[str, dict] = {}
         self.order_books: Dict[str, dict] = {}
-        #   pair_id -> {"bids": [order_id...], "asks": [order_id...]}
         self.trades: List[dict] = []
+        # MEV
+        self.commits: Dict[str, dict] = {}
 
     def balance(self, addr, asset_id=NATIVE_ASSET):
         return self.balances.get(addr, {}).get(asset_id, 0.0)
@@ -230,11 +237,12 @@ class State:
         s.order_books = {k: {"bids": list(v["bids"]), "asks": list(v["asks"])}
                          for k, v in self.order_books.items()}
         s.trades = [dict(t) for t in self.trades]
+        s.commits = {k: dict(v) for k, v in self.commits.items()}
         return s
 
 
 # =====================================================================
-# Finality / Slashing
+# Finality
 # =====================================================================
 class Finality:
     def __init__(self, interval=FINALITY_INTERVAL, threshold=FINALITY_THRESHOLD):
@@ -251,12 +259,16 @@ class Finality:
                 "votes": {str(k): list(v) for k, v in self.votes.items()}}
     @classmethod
     def from_dict(cls, d):
-        f = cls(d.get("interval", FINALITY_INTERVAL), d.get("threshold", FINALITY_THRESHOLD))
+        f = cls(d.get("interval", FINALITY_INTERVAL),
+                d.get("threshold", FINALITY_THRESHOLD))
         f.finalized_height = d.get("finalized_height", -1)
         f.votes = {int(k): set(v) for k, v in d.get("votes", {}).items()}
         return f
 
 
+# =====================================================================
+# Slashing
+# =====================================================================
 @dataclass
 class SlashingEvidence:
     validator: str; reason: str; block_index: int; invalid_block: dict
@@ -485,9 +497,10 @@ class Blockchain:
             for tx in blk.transactions:
                 self._apply_tx_to_state(self.state, tx)
             self.state.credit(blk.miner, NATIVE_ASSET, BLOCK_REWARD)
+            self._expire_commits(self.state)
 
     # ==================================================================
-    # CLOB — helpers
+    # CLOB
     # ==================================================================
     @staticmethod
     def _pair_id(base: str, quote: str) -> str:
@@ -504,24 +517,19 @@ class Blockchain:
         return state.order_books[pair_id]
 
     def _insert_order_sorted(self, state, book, order, side):
-        """Insere order_id na lista ordenada (bids desc, asks asc, FIFO no empate)."""
         lst = book["bids"] if side == "buy" else book["asks"]
-        # remove duplicata (caso raro)
         if order["order_id"] in lst:
             lst.remove(order["order_id"])
-        # insere na posição correta
         idx = 0
         for i, oid in enumerate(lst):
             existing = state.orders.get(oid)
             if not existing: continue
             if side == "buy":
-                # bids: maior preço primeiro, mais antigo primeiro
                 if (existing["price"] < order["price"] or
                     (existing["price"] == order["price"] and
                      existing["created_at"] > order["created_at"])):
                     idx = i; break
             else:
-                # asks: menor preço primeiro, mais antigo primeiro
                 if (existing["price"] > order["price"] or
                     (existing["price"] == order["price"] and
                      existing["created_at"] > order["created_at"])):
@@ -535,7 +543,6 @@ class Blockchain:
             lst.remove(order["order_id"])
 
     def _clean_book(self, state, book):
-        """Remove ordens mortas das pontas."""
         for side in ("bids", "asks"):
             lst = book[side]
             while lst:
@@ -547,29 +554,24 @@ class Blockchain:
                     break
 
     def _execute_fill(self, state, buy_order, sell_order, fill_amount, trade_price):
-        """Liquida uma execução. Atualiza balances, frozen, orders e cria Trade."""
         cost = trade_price * fill_amount
-        buyer  = buy_order["owner"]
+        buyer = buy_order["owner"]
         seller = sell_order["owner"]
-        base   = buy_order["base"]
-        quote  = buy_order["quote"]
+        base = buy_order["base"]
+        quote = buy_order["quote"]
         buy_price = buy_order["price"]
 
-        # Comprador: libera reserva do trecho preenchido, paga custo real
         state.unfreeze(buyer, quote, buy_price * fill_amount)
         state.debit(buyer, quote, cost)
         state.credit(buyer, base, fill_amount)
 
-        # Vendedor: libera reserva de base, entrega, recebe quote
         state.unfreeze(seller, base, fill_amount)
         state.debit(seller, base, fill_amount)
         state.credit(seller, quote, cost)
 
-        # Atualiza ordens
-        buy_order["filled"]  += fill_amount
+        buy_order["filled"] += fill_amount
         sell_order["filled"] += fill_amount
 
-        # Registra trade
         tid = hashlib.sha3_256(
             f"{buy_order['order_id']}:{sell_order['order_id']}:{fill_amount}:{time.time()}".encode()
         ).hexdigest()[:32]
@@ -596,12 +598,12 @@ class Blockchain:
                 if not best or best["status"] not in ("open", "partial"):
                     book["asks"].pop(0); continue
                 if best["price"] > new_order["price"]:
-                    break  # melhor ask está acima do meu bid
+                    break
                 fill = min(new_order["amount"] - new_order["filled"],
                            best["amount"] - best["filled"])
                 if fill <= 0:
                     book["asks"].pop(0); continue
-                trade_price = best["price"]  # maker
+                trade_price = best["price"]
                 self._execute_fill(state, new_order, best, fill, trade_price)
                 if best["filled"] >= best["amount"]:
                     best["status"] = "filled"
@@ -613,7 +615,7 @@ class Blockchain:
                 self._insert_order_sorted(state, book, new_order, "buy")
             else:
                 new_order["status"] = "filled"
-        else:  # sell
+        else:
             while new_order["filled"] < new_order["amount"] and book["bids"]:
                 best_id = book["bids"][0]
                 best = state.orders.get(best_id)
@@ -625,7 +627,7 @@ class Blockchain:
                            best["amount"] - best["filled"])
                 if fill <= 0:
                     book["bids"].pop(0); continue
-                trade_price = best["price"]  # maker
+                trade_price = best["price"]
                 self._execute_fill(state, best, new_order, fill, trade_price)
                 if best["filled"] >= best["amount"]:
                     best["status"] = "filled"
@@ -657,24 +659,12 @@ class Blockchain:
         if quote not in self.registry.assets: return False
 
         pair = self._pair_id(base, quote)
-        # Ordena base/quote para consistência
-        a, b = sorted([base, quote])
-        base_norm, quote_norm = (base, quote)
-        # Garante: base é sempre o primeiro alfabeticamente
-        if base != a:
-            # troca: base vira quote
-            base_norm, quote_norm = quote, base
-            # preço é invertido
-            price = 1.0 / price if price > 0 else 0
 
-        # Congela saldo
         if side == "buy":
-            # comprador precisa congelar price * amount em quote
             if state.available(owner, quote) < price * amount:
                 return False
             state.freeze(owner, quote, price * amount)
         else:
-            # vendedor precisa congelar amount em base
             if state.available(owner, base) < amount:
                 return False
             state.freeze(owner, base, amount)
@@ -724,6 +714,125 @@ class Blockchain:
         return True
 
     # ==================================================================
+    # MEV — commit / reveal
+    # ==================================================================
+    def _commit_hash(self, side, base, quote, price, amount, salt, owner):
+        payload = f"{side}:{base}:{quote}:{price}:{amount}:{salt}:{owner}"
+        return hashlib.sha3_256(payload.encode()).hexdigest()
+
+    def _op_order_commit(self, state, tx):
+        md = tx.get("metadata", {})
+        owner = tx["from"]
+        commit_hash = md.get("commit_hash", "")
+        side = md.get("side", "").lower()
+        base = md.get("base", "")
+        quote = md.get("quote", "")
+        frozen_amount = float(tx["amount"])
+
+        if side not in ("buy", "sell"): return False
+        if len(commit_hash) != 64: return False
+        if not base or not quote or base == quote: return False
+        if base not in self.registry.assets: return False
+        if quote not in self.registry.assets: return False
+        if commit_hash in state.commits: return False
+        if frozen_amount <= 0: return False
+
+        pending = [c for c in state.commits.values()
+                   if c["owner"] == owner and c["status"] == "pending"]
+        if len(pending) >= MEV_MAX_PENDING_COMMITS: return False
+
+        if side == "buy":
+            if state.available(owner, quote) < frozen_amount: return False
+            state.freeze(owner, quote, frozen_amount)
+            frozen_asset = quote
+        else:
+            if state.available(owner, base) < frozen_amount: return False
+            state.freeze(owner, base, frozen_amount)
+            frozen_asset = base
+
+        cur_block = self.last_block.index + 1
+        state.commits[commit_hash] = {
+            "commit_hash": commit_hash,
+            "owner": owner,
+            "side": side,
+            "base": base, "quote": quote,
+            "frozen_asset": frozen_asset,
+            "frozen_amount": frozen_amount,
+            "created_block": cur_block,
+            "created_at": tx["timestamp"],
+            "status": "pending",
+            "order_id": None,
+        }
+        state.nonces[owner] = state.nonce(owner) + 1
+        return True
+
+    def _op_order_reveal(self, state, tx):
+        md = tx.get("metadata", {})
+        owner = tx["from"]
+        commit_hash = md.get("commit_hash", "")
+        salt = md.get("salt", "")
+        base = tx["asset_id"]
+        quote = md.get("quote", "")
+        side = md.get("side", "").lower()
+        price = float(md.get("price", 0))
+        amount = float(tx["amount"])
+
+        c = state.commits.get(commit_hash)
+        if not c or c["status"] != "pending": return False
+        if c["owner"] != owner: return False
+        if c["side"] != side: return False
+        if c["base"] != base or c["quote"] != quote: return False
+        if price <= 0 or amount <= 0: return False
+
+        cur_block = self.last_block.index + 1
+        delta = cur_block - c["created_block"]
+        if delta < MEV_COMMIT_MIN_BLOCKS: return False
+        if delta > MEV_COMMIT_MAX_BLOCKS: return False
+
+        expected = self._commit_hash(side, base, quote, price, amount, salt, owner)
+        if expected != commit_hash: return False
+
+        required = price * amount if side == "buy" else amount
+        if required > c["frozen_amount"]: return False
+
+        state.unfreeze(owner, c["frozen_asset"], c["frozen_amount"])
+        if side == "buy":
+            if state.available(owner, quote) < price * amount: return False
+            state.freeze(owner, quote, price * amount)
+        else:
+            if state.available(owner, base) < amount: return False
+            state.freeze(owner, base, amount)
+
+        pair = self._pair_id(base, quote)
+        order_id = self._order_id(Transaction.hash(tx))
+        order = {
+            "order_id": order_id,
+            "owner": owner,
+            "pair": pair,
+            "base": base, "quote": quote,
+            "side": side,
+            "price": price, "amount": amount, "filled": 0.0,
+            "created_at": tx["timestamp"],
+            "status": "open",
+            "commit_hash": commit_hash,
+        }
+        state.orders[order_id] = order
+        self._run_matching(state, order)
+
+        c["status"] = "revealed"
+        c["order_id"] = order_id
+        state.nonces[owner] = state.nonce(owner) + 1
+        return True
+
+    def _expire_commits(self, state):
+        cur_block = self.last_block.index + 1
+        for ch, c in list(state.commits.items()):
+            if c["status"] != "pending": continue
+            if cur_block - c["created_block"] > MEV_COMMIT_MAX_BLOCKS:
+                state.unfreeze(c["owner"], c["frozen_asset"], c["frozen_amount"])
+                c["status"] = "expired"
+
+    # ==================================================================
     # Aplicação de tx
     # ==================================================================
     def _apply_tx_to_state(self, state, tx):
@@ -764,6 +873,8 @@ class Blockchain:
             return True
         if t == "order_place":  return self._op_order_place(state, tx)
         if t == "order_cancel": return self._op_order_cancel(state, tx)
+        if t == "order_commit": return self._op_order_commit(state, tx)
+        if t == "order_reveal": return self._op_order_reveal(state, tx)
         return False
 
     def _apply_registry_ops(self, tx, persist=True):
@@ -864,19 +975,14 @@ class Blockchain:
                 return False, "sem saldo BRN"
             return True, "ok"
 
-        # CLOB
         if t == "order_place":
             quote = md.get("quote", "")
             side = md.get("side", "").lower()
             price = float(md.get("price", 0))
-            if side not in ("buy", "sell"):
-                return False, "side invalido"
-            if not quote or quote == asset_id:
-                return False, "quote invalido"
-            if price <= 0:
-                return False, "price invalido"
-            if amount <= 0:
-                return False, "amount invalido"
+            if side not in ("buy", "sell"): return False, "side invalido"
+            if not quote or quote == asset_id: return False, "quote invalido"
+            if price <= 0: return False, "price invalido"
+            if amount <= 0: return False, "amount invalido"
             if asset_id not in self.registry.assets:
                 return False, f"'{asset_id}' nao registrado"
             if quote not in self.registry.assets:
@@ -895,6 +1001,52 @@ class Blockchain:
             if o["owner"] != sender: return False, "ordem nao e sua"
             if o["status"] not in ("open", "partial"):
                 return False, f"ordem {o['status']}"
+            return True, "ok"
+
+        if t == "order_commit":
+            ch = md.get("commit_hash", "")
+            side = md.get("side", "").lower()
+            base = md.get("base", "")
+            quote = md.get("quote", "")
+            if side not in ("buy", "sell"): return False, "side invalido"
+            if len(ch) != 64: return False, "commit_hash invalido"
+            if not base or not quote or base == quote: return False, "par invalido"
+            if base not in self.registry.assets: return False, f"'{base}' nao registrado"
+            if quote not in self.registry.assets: return False, f"'{quote}' nao registrado"
+            if ch in state.commits: return False, "commit duplicado"
+            frozen = float(tx["amount"])
+            if frozen <= 0: return False, "valor invalido"
+            if side == "buy":
+                if state.available(sender, quote) < frozen:
+                    return False, "saldo quote insuficiente"
+            else:
+                if state.available(sender, base) < frozen:
+                    return False, "saldo base insuficiente"
+            return True, "ok"
+
+        if t == "order_reveal":
+            ch = md.get("commit_hash", "")
+            c = state.commits.get(ch)
+            if not c: return False, "commit inexistente"
+            if c["owner"] != sender: return False, "commit nao e seu"
+            if c["status"] != "pending": return False, f"commit {c['status']}"
+            delta = (self.last_block.index + 1) - c["created_block"]
+            if delta < MEV_COMMIT_MIN_BLOCKS:
+                return False, f"aguarde {MEV_COMMIT_MIN_BLOCKS - delta} blocos"
+            if delta > MEV_COMMIT_MAX_BLOCKS:
+                return False, "commit expirado"
+            side = md.get("side", "").lower()
+            if side != c["side"]: return False, "side nao bate"
+            if tx["asset_id"] != c["base"]: return False, "base nao bate"
+            if md.get("quote", "") != c["quote"]: return False, "quote nao bate"
+            price = float(md.get("price", 0)); amt = float(tx["amount"])
+            if price <= 0 or amt <= 0: return False, "valores invalidos"
+            required = price * amt if side == "buy" else amt
+            if required > c["frozen_amount"]:
+                return False, "valor maior que o commitado"
+            expected = self._commit_hash(side, c["base"], c["quote"],
+                                          price, amt, md.get("salt", ""), sender)
+            if expected != ch: return False, "hash nao corresponde"
             return True, "ok"
 
         return False, "tipo nao suportado"
@@ -935,11 +1087,12 @@ class Blockchain:
             if self.node_identity["address"] in self.slashed: return None
 
             temp = self.state.copy()
+            self._expire_commits(temp)
+
             real_reg = self.registry
             self.registry = AssetRegistry.from_dict(self.registry.to_dict())
             chosen = []
             try:
-                # ordena por timestamp+hash (determinístico)
                 for tx in sorted(self.pending,
                                  key=lambda t: (t["timestamp"], Transaction.hash(t))):
                     if not Transaction.verify_signature(tx): continue
@@ -974,6 +1127,7 @@ class Blockchain:
                 self._mempool_remove(tx)
             self.state.credit(block.miner, NATIVE_ASSET, BLOCK_REWARD)
             self.pending = [t for t in self.pending if t not in chosen]
+            self._expire_commits(self.state)
 
             self.chain.append(block)
             self._persist_block(block)
@@ -1003,6 +1157,7 @@ class Blockchain:
 
             sanitized = [Transaction.sanitize(tx) for tx in blk.transactions]
             temp = self.state.copy()
+            self._expire_commits(temp)
             real_reg = self.registry
             self.registry = AssetRegistry.from_dict(self.registry.to_dict())
             try:
@@ -1024,6 +1179,7 @@ class Blockchain:
             self.state.credit(blk.miner, NATIVE_ASSET, BLOCK_REWARD)
             hashes = {Transaction.hash(tx) for tx in sanitized}
             self.pending = [t for t in self.pending if Transaction.hash(t) not in hashes]
+            self._expire_commits(self.state)
 
             self.chain.append(blk)
             self._persist_block(blk)
@@ -1100,6 +1256,14 @@ class Blockchain:
                         if not self._apply_tx_to_state(new_state, tx): return False
                         self._apply_registry_ops(tx, persist=False)
                     new_state.credit(blk.miner, NATIVE_ASSET, BLOCK_REWARD)
+                    # expira commits após cada bloco
+                    cur = blk.index
+                    for ch, c in list(new_state.commits.items()):
+                        if c["status"] != "pending": continue
+                        if cur - c["created_block"] > MEV_COMMIT_MAX_BLOCKS:
+                            new_state.unfreeze(c["owner"], c["frozen_asset"],
+                                               c["frozen_amount"])
+                            c["status"] = "expired"
                 committed_reg = self.registry
             except Exception as e:
                 print(f"[chain] erro replay: {e}"); return False
@@ -1160,7 +1324,7 @@ class Blockchain:
         return {"ok": True, "msg": f"{FAUCET_AMOUNT} BRN enfileirados.", "tx": tx}
 
     # ==================================================================
-    # API CLOB para a carteira
+    # APIs para carteira
     # ==================================================================
     def order_book(self, base: str, quote: str, depth: int = 10) -> dict:
         pair = self._pair_id(base, quote)
@@ -1194,10 +1358,8 @@ class Blockchain:
             if o["status"] not in status_in: continue
             out.append({
                 "order_id": o["order_id"],
-                "pair": o["pair"],
-                "side": o["side"],
-                "price": o["price"],
-                "amount": o["amount"],
+                "pair": o["pair"], "side": o["side"],
+                "price": o["price"], "amount": o["amount"],
                 "filled": o["filled"],
                 "remaining": o["amount"] - o["filled"],
                 "status": o["status"],
@@ -1214,6 +1376,31 @@ class Blockchain:
                 out.append({**t, "role": role})
         out.sort(key=lambda x: x["timestamp"], reverse=True)
         return out[:limit]
+
+    def my_commits(self, addr: str, status_in=None) -> list:
+        status_in = status_in or ("pending", "revealed", "expired")
+        cur_block = self.last_block.index
+        out = []
+        for c in self.state.commits.values():
+            if c["owner"] != addr: continue
+            if c["status"] not in status_in: continue
+            elapsed = cur_block - c["created_block"]
+            out.append({
+                "commit_hash": c["commit_hash"][:16] + "...",
+                "commit_hash_full": c["commit_hash"],
+                "side": c["side"],
+                "base": c["base"], "quote": c["quote"],
+                "frozen_asset": c["frozen_asset"],
+                "frozen_amount": c["frozen_amount"],
+                "created_block": c["created_block"],
+                "blocks_elapsed": elapsed,
+                "blocks_until_ready": max(0, MEV_COMMIT_MIN_BLOCKS - elapsed),
+                "blocks_until_expire": max(0, MEV_COMMIT_MAX_BLOCKS - elapsed),
+                "status": c["status"],
+                "order_id": c["order_id"],
+            })
+        out.sort(key=lambda x: x["created_block"], reverse=True)
+        return out
 
     def portfolio(self, addr):
         out = {}
@@ -1240,8 +1427,7 @@ class Blockchain:
             nonce=self.state.nonce(addr),
             private_key_hex=identity["spend_secret_key"],
             public_key_hex=identity["public_key"],
-            metadata={"quote": quote, "side": side,
-                      "price": float(price)})
+            metadata={"quote": quote, "side": side, "price": float(price)})
         return self.add_transaction(tx)
 
     def cancel_order(self, identity: dict, order_id: str) -> dict:
@@ -1256,6 +1442,52 @@ class Blockchain:
             private_key_hex=identity["spend_secret_key"],
             public_key_hex=identity["public_key"],
             metadata={"order_id": order_id})
+        return self.add_transaction(tx)
+
+    def commit_order(self, identity: dict, base: str, quote: str, side: str,
+                     price: float, amount: float, salt: str = None) -> dict:
+        if salt is None:
+            salt = secrets.token_hex(16)
+        addr = identity["address"]
+        frozen = (price * amount) if side == "buy" else amount
+        ch = self._commit_hash(side, base, quote, price, amount, salt, addr)
+        tx = Transaction.build(
+            tx_type="order_commit",
+            asset_id=base,
+            sender_address=addr,
+            receiver_address=addr,
+            amount=frozen,
+            nonce=self.state.nonce(addr),
+            private_key_hex=identity["spend_secret_key"],
+            public_key_hex=identity["public_key"],
+            metadata={"commit_hash": ch, "side": side,
+                      "base": base, "quote": quote})
+        r = self.add_transaction(tx)
+        if r.get("ok"):
+            r["commit_hash"] = ch
+            r["salt"] = salt
+            r["price"] = price
+            r["amount"] = amount
+            r["side"] = side
+            r["base"] = base
+            r["quote"] = quote
+        return r
+
+    def reveal_order(self, identity: dict, commit_hash: str, salt: str,
+                     base: str, quote: str, side: str,
+                     price: float, amount: float) -> dict:
+        addr = identity["address"]
+        tx = Transaction.build(
+            tx_type="order_reveal",
+            asset_id=base,
+            sender_address=addr,
+            receiver_address=addr,
+            amount=amount,
+            nonce=self.state.nonce(addr),
+            private_key_hex=identity["spend_secret_key"],
+            public_key_hex=identity["public_key"],
+            metadata={"commit_hash": commit_hash, "salt": salt,
+                      "side": side, "quote": quote, "price": price})
         return self.add_transaction(tx)
 
     def slashing_report(self):
