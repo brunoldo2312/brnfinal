@@ -1,6 +1,5 @@
 # explorer.py — Ponto de entrada principal.
-# Sobe o nó completo (P2P + consenso PoS + web + ngrok) e,
-# em paralelo, imprime no terminal o relatório da blockchain.
+# Sobe o nó completo (P2P + PoW + CLOB + MEV + ngrok) e imprime relatório.
 
 import json
 import os
@@ -13,15 +12,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Carrega .env antes de importar os módulos da blockchain (eles leem env vars)
 load_dotenv()
 
-DB_PATH = os.environ.get("BRN_DB_PATH", "blockchain.db")
+DB_PATH         = os.environ.get("BRN_DB_PATH", "blockchain.db")
 REPORT_INTERVAL = int(os.environ.get("BRN_REPORT_INTERVAL", "30"))
 
 
 # ==================================================================
-# Relatório em terminal (lê o SQLite)
+# Helpers
 # ==================================================================
 def short(addr: str) -> str:
     if not addr:
@@ -33,11 +31,50 @@ def fmt_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def tx_summary(tx: dict) -> str:
+    t = tx.get("type", "?")
+    if t == "transfer":
+        return (f"transfer {tx.get('amount', 0):.4f} "
+                f"{tx.get('asset_id','?')} | "
+                f"{short(tx['from'])} → {short(tx['to'])}")
+    if t == "issue":
+        return (f"issue    {tx.get('amount', 0):.4f} "
+                f"{tx.get('asset_id','?')} → {short(tx['to'])}")
+    if t == "redeem":
+        return (f"redeem   {tx.get('amount', 0):.4f} "
+                f"{tx.get('asset_id','?')} de {short(tx['from'])}")
+    if t == "order_place":
+        md = tx.get("metadata", {})
+        return (f"order    {md.get('side','?').upper():>4} "
+                f"{tx.get('amount',0):.4f} {tx.get('asset_id','?')} @ "
+                f"{md.get('price',0):.6f} {md.get('quote','?')}")
+    if t == "order_commit":
+        md = tx.get("metadata", {})
+        return (f"commit   {md.get('side','?').upper():>4} "
+                f"hash={md.get('commit_hash','')[:12]}…")
+    if t == "order_reveal":
+        md = tx.get("metadata", {})
+        return (f"reveal   {md.get('side','?').upper():>4} "
+                f"{tx.get('amount',0):.4f} {tx.get('asset_id','?')} @ "
+                f"{md.get('price',0):.6f} {md.get('quote','?')}")
+    if t == "order_cancel":
+        md = tx.get("metadata", {})
+        return f"cancel   order={md.get('order_id','')[:12]}…"
+    if t == "asset_create":
+        md = tx.get("metadata", {})
+        return f"asset    create {md.get('asset_id','?')}"
+    if t in ("kyc_register", "kyc_revoke"):
+        return f"{t:<8} {short(tx.get('to',''))}"
+    return f"{t} | {short(tx.get('from',''))} → {short(tx.get('to',''))}"
+
+
+# ==================================================================
+# Relatório
+# ==================================================================
 def print_report():
     if not Path(DB_PATH).exists():
-        print(f"[explorer] {DB_PATH} ainda não existe (aguarde o primeiro bloco).")
+        print(f"[explorer] {DB_PATH} ainda não existe.")
         return
-
     try:
         conn = sqlite3.connect(DB_PATH)
     except sqlite3.Error as e:
@@ -52,19 +89,20 @@ def print_report():
     rows = conn.execute("SELECT data FROM blocks ORDER BY idx ASC").fetchall()
     total_tx = 0
     total_vol = 0.0
-
     print(f"\n BLOCOS ({len(rows)}):")
     for (data,) in rows:
         blk = json.loads(data)
         txs = blk.get("transactions", [])
         total_tx += len(txs)
+        miner = blk.get("miner") or blk.get("validator") or ""
+        diff = blk.get("difficulty", "-")
+        nonce = blk.get("nonce", "-")
         print(f"  #{blk['index']:>4} | {fmt_time(blk['timestamp'])} | "
-              f"val={short(blk.get('validator','')):22} | "
+              f"miner={short(miner):22} | diff={diff} nonce={nonce} | "
               f"{len(txs)} tx | {blk.get('hash','')[:16]}…")
         for tx in txs:
-            total_vol += tx.get("amount", 0.0)
-            print(f"          → {short(tx['from'])} → {short(tx['to'])} | "
-                  f"{tx['amount']:.4f} BRN | {fmt_time(tx.get('timestamp',0))}")
+            total_vol += tx.get("amount", 0.0) or 0.0
+            print(f"          → {tx_summary(tx)}")
 
     # ----- MEMPOOL -----
     mrows = conn.execute("SELECT data FROM mempool ORDER BY ts ASC").fetchall()
@@ -73,8 +111,7 @@ def print_report():
         print("   (vazia)")
     for (data,) in mrows:
         tx = json.loads(data)
-        print(f"   {short(tx['from'])} → {short(tx['to'])} | "
-              f"{tx['amount']:.4f} BRN | nonce={tx['nonce']}")
+        print(f"   {tx_summary(tx)} | nonce={tx.get('nonce','?')}")
 
     # ----- SLASHING -----
     srows = conn.execute(
@@ -89,17 +126,16 @@ def print_report():
     print("\n" + "-" * 100)
     print(f" Total de blocos ....: {len(rows)}")
     print(f" Total de tx ........: {total_tx}")
-    print(f" Volume confirmado ..: {total_vol:.4f} BRN")
+    print(f" Volume confirmado ..: {total_vol:.4f}")
     print(f" Pendentes ..........: {len(mrows)}")
     print(f" Slashed ............: {len(srows)}")
     print("-" * 100)
 
 
 # ==================================================================
-# Loop de relatório em background
+# Loop de relatório
 # ==================================================================
 def report_loop():
-    # Primeiro relatório após alguns segundos (dá tempo do nó iniciar)
     time.sleep(5)
     while True:
         try:
@@ -110,43 +146,49 @@ def report_loop():
 
 
 # ==================================================================
-# Main — sobe o nó completo + loop de relatório
+# Main
 # ==================================================================
 def main():
-    print("=" * 60)
+    print("=" * 72)
     print(" BRN Explorer — iniciando nó completo")
-    print("=" * 60)
+    print("=" * 72)
 
-    # Import tardio para garantir que .env já foi carregado
     from node import Node
 
     node = Node()
-
-    # Sobe P2P + consenso + web + ngrok (dentro de uma thread)
-    # para que o loop de relatório possa rodar em paralelo.
     t_node = threading.Thread(target=node.start, daemon=True, name="node")
     t_node.start()
 
-    # Sobe loop de relatório em background
     t_report = threading.Thread(target=report_loop, daemon=True, name="report")
     t_report.start()
 
-    # Mensagem final de instruções
-    time.sleep(2)
-    print("\n" + "=" * 60)
-    print(" Dashboard disponível na URL do ngrok mostrada acima.")
-    print(f" Banco SQLite: {os.path.abspath(DB_PATH)}")
-    print(f" Relatório no terminal a cada {REPORT_INTERVAL}s.")
-    print(" Pressione Ctrl+C para encerrar.")
-    print("=" * 60 + "\n")
+    # espera ngrok (até 10s)
+    if os.environ.get("BRN_NGROK", "0") == "1":
+        for _ in range(50):
+            if node.public_endpoint:
+                break
+            time.sleep(0.2)
 
-    # Mantém o processo principal vivo
+    time.sleep(1)
+    print("\n" + "=" * 72)
+    if node.public_endpoint:
+        h, p = node.public_endpoint
+        print(f" NGROK público: {h}:{p}")
+        print(f" Peers devem usar:")
+        print(f"   BRN_HARDCODED_SEEDS={h}:{p}")
+    else:
+        print(" NGROK: inativo ou ainda subindo.")
+    print(f" Banco SQLite: {os.path.abspath(DB_PATH)}")
+    print(f" Relatório a cada {REPORT_INTERVAL}s.")
+    print(" Pressione Ctrl+C para encerrar.")
+    print("=" * 72 + "\n")
+
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[explorer] encerrando…")
-        node.running = False
+        node.stop()
         sys.exit(0)
 
 
