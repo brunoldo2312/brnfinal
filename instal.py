@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-instal.py — instalador completo do BRN Produção v3.
-Gera o projeto brn-prod/ com: explorador, NGROK seguro, HD wallet,
-P2P autenticado, checkpoints, métricas, Docker, CI.
-Uso: python instal.py [destino]
+instal.py — instalador completo do BRN Produção v3.1.
+
+Gera o projeto brn-prod/ com:
+  - Blockchain UTXO + PoW com reajuste
+  - P2P autenticado (HMAC) com framing binário
+  - HD wallet BIP-39/32/44
+  - Carteira Argon2id + AES-GCM
+  - Explorador Flask com rate-limit, CSP, token de API
+  - NGROK seguro (token via env / .env / prompt)
+  - Checkpoints assinados + reorg por chainwork
+  - Métricas Prometheus, Docker non-root, CI completo
+
+Uso:
+    python instal.py [destino]
+    python instal.py brn-prod
 """
 from __future__ import annotations
+
 import sys
 from pathlib import Path
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else "brn-prod").resolve()
 F: dict[str, str] = {}
+
 
 # ============================================================ raiz
 F[".gitignore"] = r'''
@@ -38,6 +51,9 @@ venv/
 htmlcov/
 *.log
 .DS_Store
+dist/
+build/
+*.egg-info/
 '''.lstrip("\n")
 
 F["requirements.txt"] = r'''
@@ -54,15 +70,53 @@ prometheus-client==0.21.0
 python-dotenv==1.0.1
 ngrok==1.4.0
 gunicorn==23.0.0
+orjson==3.10.7
 '''.lstrip("\n")
 
 F["requirements-dev.txt"] = r'''
 -r requirements.txt
 pytest==8.3.3
 pytest-cov==6.0.0
+pytest-asyncio==0.24.0
 ruff==0.6.9
+mypy==1.11.2
 bandit==1.7.10
 pip-audit==2.7.1
+'''.lstrip("\n")
+
+F["pyproject.toml"] = r'''
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brn"
+version = "3.1.0"
+description = "BRN — blockchain UTXO + explorador"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[project.scripts]
+brn = "brn.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["brn*"]
+
+[tool.pytest.ini_options]
+addopts = "-q --cov=brn --cov-report=term-missing"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
 '''.lstrip("\n")
 
 F[".env.example"] = r'''
@@ -80,12 +134,15 @@ BRN_SEEDS=
 BRN_LOG_LEVEL=INFO
 BRN_RATE_LIMIT=120/minute
 BRN_PUBLIC_TUNNEL=0
+BRN_FAUCET_ADDRESS=
+BRN_FAUCET_AMOUNT=100
+BRN_FAUCET_COOLDOWN=3600
 NGROK_AUTHTOKEN=
 NGROK_DOMAIN=
 '''.lstrip("\n")
 
 F["Makefile"] = r'''
-.PHONY: install dev test lint sast audit ci run clean key api-token
+.PHONY: install dev test lint sast audit ci run clean key api-token fmt typecheck
 
 install:
 	python -m pip install -r requirements.txt
@@ -95,23 +152,65 @@ test:
 	pytest -q --cov=brn --cov-report=term-missing
 lint:
 	ruff check brn tests
+fmt:
+	ruff check --fix brn tests
+typecheck:
+	mypy brn
 sast:
 	bandit -r brn -ll
 audit:
 	pip-audit -r requirements.txt
-ci: lint test sast audit
+ci: lint typecheck test sast audit
 run:
-	python -m brn.cli node --with-explorer
+	python -m brn node --with-explorer
 key:
 	python -c "import secrets;print('BRN_NETWORK_KEY='+secrets.token_hex(32))"
 api-token:
 	python -c "import secrets;print('BRN_API_TOKEN='+secrets.token_urlsafe(32))"
 clean:
-	rm -rf .pytest_cache .ruff_cache __pycache__ */__pycache__ .coverage htmlcov
+	rm -rf .pytest_cache .ruff_cache .mypy_cache __pycache__ */__pycache__ .coverage htmlcov dist build *.egg-info
 '''.lstrip("\n")
 
-# ============================================================ brn
-F["brn/__init__.py"] = '__version__ = "3.0.0"\n'
+# ============================================================ brn/
+F["brn/__init__.py"] = '__version__ = "3.1.0"\n'
+
+F["brn/__main__.py"] = r'''
+"""Permite executar: python -m brn <cmd> ..."""
+from .cli import main
+
+if __name__ == "__main__":
+    main()
+'''.lstrip("\n")
+
+F["brn/constants.py"] = r'''
+"""Constantes do protocolo BRN."""
+from __future__ import annotations
+
+PROTOCOL_VERSION = 3
+NETWORK_MAGIC = b"BRNv3"
+
+REWARD = 50 * 10**8
+HALVING = 210_000
+MAX_MEMPOOL = 5_000
+MEMPOOL_TTL = 24 * 3600
+MAX_BLOCK_TXS = 5_000
+MAX_INPUTS = 1_000
+MAX_OUTPUTS = 1_000
+COINBASE_MATURITY = 100
+
+ADDRESS_PREFIX = "brn1"
+DOMAIN_TX = b"BRN-TX-v3\x00"
+DOMAIN_BLOCK = b"BRN-BLOCK-v3\x00"
+DOMAIN_CKPT = b"BRN-CKPT-v3\x00"
+DOMAIN_P2P = b"BRN-P2P-v3\x00"
+
+P2P_MAX_MSG = 2 * 1024 * 1024
+P2P_READ_TIMEOUT = 30.0
+P2P_HANDSHAKE_TIMEOUT = 5.0
+P2P_PING_INTERVAL = 30.0
+P2P_PEER_TIMEOUT = 120.0
+P2P_MAX_PEERS = 32
+'''.lstrip("\n")
 
 F["brn/config.py"] = r'''
 from __future__ import annotations
@@ -132,19 +231,29 @@ class Settings(BaseSettings):
     p2p_port: Annotated[int, Field(ge=1, le=65535)] = 6001
     explorer_host: str = "127.0.0.1"
     explorer_port: Annotated[int, Field(ge=1, le=65535)] = 8080
-    api_token: Annotated[str, Field(min_length=16)]
-    network_key: Annotated[str, Field(min_length=32)]
+
+    # api_token é opcional aqui — quem precisa (explorer) exige.
+    api_token: str = ""
+
+    # network_key é opcional na config global; P2P valida quando conecta.
+    network_key: str = ""
+
     difficulty: Annotated[int, Field(ge=1, le=12)] = 4
     seeds: str = ""
     log_level: str = "INFO"
     rate_limit: str = "120/minute"
     public_tunnel: bool = False
     max_peers: Annotated[int, Field(ge=1, le=256)] = 32
-    max_msg_bytes: Annotated[int, Field(ge=1024, le=8 * 1024 * 1024)] = 2 * 1024 * 1024
+
+    faucet_address: str = ""
+    faucet_amount: float = 100.0
+    faucet_cooldown: int = 3600
 
     @field_validator("network_key")
     @classmethod
-    def _k(cls, v: str) -> str:
+    def _validate_key(cls, v: str) -> str:
+        if not v:
+            return v
         try:
             raw = bytes.fromhex(v)
         except ValueError as e:
@@ -155,13 +264,13 @@ class Settings(BaseSettings):
 
     @property
     def seeds_list(self) -> list[tuple[str, int]]:
-        out = []
-        for it in self.seeds.split(","):
-            it = it.strip()
-            if not it:
+        out: list[tuple[str, int]] = []
+        for item in self.seeds.split(","):
+            item = item.strip()
+            if not item:
                 continue
-            h, _, p = it.partition(":")
-            out.append((h, int(p) if p else 6001))
+            host, _, port = item.partition(":")
+            out.append((host, int(port) if port else 6001))
         return out
 
     def ensure_dirs(self) -> None:
@@ -188,24 +297,28 @@ request_id: ContextVar[str] = ContextVar("request_id", default="")
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        p = {"ts": time.time(), "level": record.levelname,
-             "logger": record.name, "msg": record.getMessage()}
+        payload = {
+            "ts": time.time(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
         rid = request_id.get()
         if rid:
-            p["request_id"] = rid
+            payload["request_id"] = rid
         if record.exc_info:
-            p["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = self.formatException(record.exc_info)
         for k, v in getattr(record, "extra_fields", {}).items():
-            p[k] = v
-        return json.dumps(p, ensure_ascii=False)
+            payload[k] = v
+        return json.dumps(payload, ensure_ascii=False)
 
 
 def setup(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers.clear()
-    h = logging.StreamHandler(sys.stdout)
-    h.setFormatter(JsonFormatter())
-    root.addHandler(h)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root.addHandler(handler)
     root.setLevel(level.upper())
 
 
@@ -243,6 +356,9 @@ class SecureToken:
         return f"SecureToken({_mask(self._value)})"
     __str__ = __repr__
 
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
     @classmethod
     def load(cls, name: str, *, env_file: Path | None = None,
              prompt: str | None = None) -> "SecureToken":
@@ -256,11 +372,12 @@ class SecureToken:
                 if "=" in line and not line.strip().startswith("#"):
                     k, _, val = line.partition("=")
                     if k.strip() == name and val.strip():
-                        os.environ[name] = val.strip()
+                        val = val.strip()
+                        os.environ[name] = val
                         log.info("token.loaded", extra={"extra_fields": {
                             "source": "env_file", "name": name,
-                            "mask": _mask(val.strip())}})
-                        return cls(val.strip())
+                            "mask": _mask(val)}})
+                        return cls(val)
         if prompt:
             v = getpass.getpass(prompt).strip()
             if v:
@@ -279,7 +396,10 @@ def load_or_create_api_token(data_dir: Path) -> SecureToken:
     v = secrets.token_urlsafe(32)
     data_dir.mkdir(parents=True, exist_ok=True)
     f.write_text(v)
-    os.chmod(f, 0o600)
+    try:
+        os.chmod(f, 0o600)
+    except OSError:
+        pass
     log.info("api_token.created", extra={"extra_fields": {
         "path": str(f), "mask": _mask(v)}})
     return SecureToken(v)
@@ -293,10 +413,8 @@ from typing import Any
 
 from coincurve import PrivateKey, PublicKey
 
-DOMAIN_TX = b"BRN-TX-v3\x00"
-DOMAIN_BLOCK = b"BRN-BLOCK-v3\x00"
-DOMAIN_CKPT = b"BRN-CKPT-v3\x00"
-ADDRESS_PREFIX = "brn1"
+from .constants import (ADDRESS_PREFIX, DOMAIN_BLOCK, DOMAIN_CKPT,
+                        DOMAIN_TX)
 
 
 def canonical_json(obj: Any) -> bytes:
@@ -320,8 +438,17 @@ def pubkey_from_priv(priv: bytes) -> bytes:
     return PrivateKey(priv).public_key.format(compressed=True)
 
 
+def _xonly(pub33: bytes) -> bytes:
+    """Extrai a coordenada x (32 bytes) — formato BIP-340."""
+    if len(pub33) == 32:
+        return pub33
+    if len(pub33) == 33 and pub33[0] in (2, 3):
+        return pub33[1:]
+    raise ValueError("pubkey inválida")
+
+
 def pubkey_to_address(pub: bytes) -> str:
-    return ADDRESS_PREFIX + sha256(pub)[:20].hex()
+    return ADDRESS_PREFIX + sha256(_xonly(pub))[:20].hex()
 
 
 def address_is_valid(a: str) -> bool:
@@ -359,11 +486,13 @@ def verify_tx_signature(tx: dict) -> bool:
     try:
         sig = bytes.fromhex(tx["signature"])
         pub = bytes.fromhex(tx["from_pubkey"])
-        if len(sig) != 64 or len(pub) != 33:
+        if len(sig) != 64:
+            return False
+        if len(pub) not in (32, 33):
             return False
         if pubkey_to_address(pub) != tx["from_address"]:
             return False
-        return PublicKey(pub).verify_schnorr(sig, tx_signing_hash(tx))
+        return PublicKey(_xonly(pub)).verify_schnorr(sig, tx_signing_hash(tx))
     except Exception:
         return False
 
@@ -405,7 +534,7 @@ def sign_checkpoint(c: dict, priv: bytes) -> dict:
 
 def verify_checkpoint(c: dict, pub: bytes) -> bool:
     try:
-        return PublicKey(pub).verify_schnorr(
+        return PublicKey(_xonly(pub)).verify_schnorr(
             bytes.fromhex(c["signature"]), ckpt_hash(c))
     except Exception:
         return False
@@ -546,14 +675,19 @@ def save(path: str | Path, w: Wallet, password: str) -> None:
         "address": w.address,
     }).encode()
     ct = AESGCM(key).encrypt(nonce, pt, AAD)
-    blob = {"version": VERSION, "kdf": "argon2id",
-            "kdf_params": {"t": T, "m": M, "p": P},
-            "salt": salt.hex(), "nonce": nonce.hex(),
-            "ciphertext": ct.hex()}
+    blob = {
+        "version": VERSION, "kdf": "argon2id",
+        "kdf_params": {"t": T, "m": M, "p": P},
+        "salt": salt.hex(), "nonce": nonce.hex(),
+        "ciphertext": ct.hex(),
+    }
     p = Path(path)
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(blob, indent=2))
-    os.chmod(tmp, 0o600)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     tmp.replace(p)
 
 
@@ -566,7 +700,7 @@ def load(path: str | Path, password: str) -> Wallet:
         pt = AESGCM(key).decrypt(bytes.fromhex(blob["nonce"]),
                                  bytes.fromhex(blob["ciphertext"]), AAD)
     except Exception as e:
-        raise ValueError("Senha incorreta ou corrompido") from e
+        raise ValueError("Senha incorreta ou arquivo corrompido") from e
     d = json.loads(pt)
     return Wallet(bytes.fromhex(d["private_key"]),
                   bytes.fromhex(d["public_key"]), d["address"])
@@ -581,7 +715,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -593,10 +727,11 @@ CREATE TABLE IF NOT EXISTS blocks (
     prev TEXT NOT NULL, merkle_root TEXT NOT NULL,
     timestamp INTEGER NOT NULL, difficulty INTEGER NOT NULL,
     nonce INTEGER NOT NULL, raw TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
 CREATE TABLE IF NOT EXISTS utxos (
     txid TEXT NOT NULL, vout INTEGER NOT NULL,
     address TEXT NOT NULL, amount INTEGER NOT NULL CHECK (amount > 0),
-    height INTEGER NOT NULL,
+    height INTEGER NOT NULL, coinbase INTEGER NOT NULL DEFAULT 0,
     spent INTEGER NOT NULL DEFAULT 0 CHECK (spent IN (0,1)),
     spent_by TEXT, PRIMARY KEY (txid, vout));
 CREATE INDEX IF NOT EXISTS idx_utxo_unspent ON utxos(address) WHERE spent=0;
@@ -621,10 +756,11 @@ class Storage:
             row = self._conn.execute(
                 "SELECT version FROM schema_version LIMIT 1").fetchone()
             if row is None:
-                self._conn.execute("INSERT INTO schema_version VALUES(?)",
-                                   (SCHEMA_VERSION,))
+                self._conn.execute(
+                    "INSERT INTO schema_version VALUES(?)", (SCHEMA_VERSION,))
             elif row["version"] != SCHEMA_VERSION:
-                raise RuntimeError("Schema incompatível")
+                raise RuntimeError(
+                    f"Schema incompatível: {row['version']} != {SCHEMA_VERSION}")
 
     def close(self):
         with self._lock:
@@ -641,6 +777,7 @@ class Storage:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    # ---------- meta ----------
     def get_meta(self, k: str):
         with self._lock:
             r = self._conn.execute(
@@ -653,6 +790,7 @@ class Storage:
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                       (k, v))
 
+    # ---------- blocks ----------
     def chain_tip(self):
         with self._lock:
             return self._conn.execute(
@@ -669,7 +807,14 @@ class Storage:
             return self._conn.execute(
                 "SELECT * FROM blocks WHERE hash=?", (h,)).fetchone()
 
+    def recent_blocks(self, limit: int = 20):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT height,hash,prev,timestamp,difficulty FROM blocks "
+                "ORDER BY height DESC LIMIT ?", (limit,)).fetchall()
+
     def apply_block(self, block: dict, txs: list[dict]):
+        """Aplica bloco com atualização UTXO atômica."""
         with self.tx() as c:
             c.execute("INSERT INTO blocks(height,hash,prev,merkle_root,"
                       "timestamp,difficulty,nonce,raw) VALUES(?,?,?,?,?,?,?,?)",
@@ -679,7 +824,8 @@ class Storage:
                        _json.dumps(block)))
             for tx in txs:
                 txid = tx["txid"]
-                if not tx.get("coinbase"):
+                is_cb = bool(tx.get("coinbase"))
+                if not is_cb:
                     for inp in tx["inputs"]:
                         cur = c.execute(
                             "UPDATE utxos SET spent=1, spent_by=? "
@@ -692,23 +838,59 @@ class Storage:
                 for vout, out in enumerate(tx["outputs"]):
                     c.execute(
                         "INSERT INTO utxos(txid,vout,address,amount,height,"
-                        "spent) VALUES(?,?,?,?,?,0)",
+                        "coinbase,spent) VALUES(?,?,?,?,?,?,0)",
                         (txid, vout, out["address"], out["amount"],
-                         block["height"]))
+                         block["height"], 1 if is_cb else 0))
                 c.execute("DELETE FROM mempool WHERE txid=?", (txid,))
 
     def revert_block(self, block: dict):
+        """Desfaz um bloco aplicado (para reorg)."""
         with self.tx() as c:
             for tx in block.get("txs", []):
-                c.execute("DELETE FROM utxos WHERE txid=?", (tx["txid"],))
+                txid = tx["txid"]
+                c.execute("DELETE FROM utxos WHERE txid=?", (txid,))
                 if not tx.get("coinbase"):
                     for inp in tx["inputs"]:
                         c.execute(
                             "UPDATE utxos SET spent=0, spent_by=NULL "
                             "WHERE txid=? AND vout=? AND spent_by=?",
-                            (inp["txid"], inp["vout"], tx["txid"]))
+                            (inp["txid"], inp["vout"], txid))
             c.execute("DELETE FROM blocks WHERE hash=?", (block["hash"],))
 
+    # ---------- UTXO ----------
+    def utxo_get(self, txid: str, vout: int):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM utxos WHERE txid=? AND vout=?",
+                (txid, vout)).fetchone()
+
+    def utxo_exists_unspent(self, txid: str, vout: int) -> bool:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM utxos WHERE txid=? AND vout=? AND spent=0",
+                (txid, vout)).fetchone() is not None
+
+    def balance_of(self, addr: str) -> int:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT COALESCE(SUM(amount),0) s FROM utxos "
+                "WHERE address=? AND spent=0", (addr,)).fetchone()
+            return int(r["s"])
+
+    def utxos_of(self, addr: str):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM utxos WHERE address=? AND spent=0 "
+                "ORDER BY amount DESC", (addr,)).fetchall()
+
+    def supply(self) -> int:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT COALESCE(SUM(amount),0) s FROM utxos "
+                "WHERE spent=0").fetchone()
+            return int(r["s"])
+
+    # ---------- mempool ----------
     def mempool_add(self, txid: str, raw: str) -> bool:
         with self.tx() as c:
             try:
@@ -744,44 +926,7 @@ class Storage:
             return c.execute("DELETE FROM mempool WHERE added_at < ?",
                              (cutoff,)).rowcount
 
-    def utxo_exists_unspent(self, txid: str, vout: int) -> bool:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT 1 FROM utxos WHERE txid=? AND vout=? AND spent=0",
-                (txid, vout)).fetchone() is not None
-
-    def utxo_get(self, txid: str, vout: int):
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM utxos WHERE txid=? AND vout=?",
-                (txid, vout)).fetchone()
-
-    def balance_of(self, addr: str) -> int:
-        with self._lock:
-            r = self._conn.execute(
-                "SELECT COALESCE(SUM(amount),0) s FROM utxos "
-                "WHERE address=? AND spent=0", (addr,)).fetchone()
-            return int(r["s"])
-
-    def utxos_of(self, addr: str):
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM utxos WHERE address=? AND spent=0 "
-                "ORDER BY amount DESC", (addr,)).fetchall()
-
-    def supply(self) -> int:
-        with self._lock:
-            r = self._conn.execute(
-                "SELECT COALESCE(SUM(amount),0) s FROM utxos "
-                "WHERE spent=0").fetchone()
-            return int(r["s"])
-
-    def recent_blocks(self, limit: int = 20):
-        with self._lock:
-            return self._conn.execute(
-                "SELECT height,hash,prev,timestamp,difficulty FROM blocks "
-                "ORDER BY height DESC LIMIT ?", (limit,)).fetchall()
-
+    # ---------- checkpoints ----------
     def add_checkpoint(self, h: int, hash_: str, signer: str, sig: str):
         with self.tx() as c:
             c.execute("INSERT OR REPLACE INTO checkpoints VALUES(?,?,?,?)",
@@ -792,6 +937,7 @@ class Storage:
             return self._conn.execute(
                 "SELECT * FROM checkpoints WHERE height=?", (h,)).fetchone()
 
+    # ---------- explorer ----------
     def all_txs(self, limit: int = 50):
         with self._lock:
             rows = self._conn.execute(
@@ -837,38 +983,39 @@ import json
 import time
 
 from .checkpoints import verify_at_height
+from .constants import (HALVING, MAX_BLOCK_TXS, MAX_INPUTS, MAX_MEMPOOL,
+                        MAX_OUTPUTS, MEMPOOL_TTL, REWARD)
 from .crypto import (address_is_valid, compute_block_hash, compute_txid,
-                     hash_meets_difficulty, merkle_root, verify_tx_signature)
+                     hash_meets_difficulty, merkle_root,
+                     verify_tx_signature)
 from .storage import Storage
-
-REWARD = 50 * 10**8
-HALVING = 210_000
-MAX_MEMPOOL = 5_000
-MEMPOOL_TTL = 24 * 3600
 
 
 class Blockchain:
     def __init__(self, storage: Storage, difficulty: int = 4,
-                 max_block_txs: int = 5000):
+                 max_block_txs: int = MAX_BLOCK_TXS):
         self.db = storage
         self.difficulty = difficulty
         self.max_block_txs = max_block_txs
 
+    # ---------- genesis ----------
     def ensure_genesis(self, miner: str):
         if self.db.chain_tip() is not None:
             return
         if not address_is_valid(miner):
             raise ValueError("Endereço genesis inválido")
-        cb = {"coinbase": True, "inputs": [],
-              "outputs": [{"address": miner, "amount": REWARD}],
-              "timestamp": 1700000000, "nonce": 0,
-              "from_pubkey": "00" * 33, "from_address": miner,
-              "signature": "00" * 64}
+        cb = {
+            "coinbase": True, "inputs": [],
+            "outputs": [{"address": miner, "amount": REWARD}],
+            "timestamp": 1700000000, "nonce": 0,
+        }
         cb["txid"] = compute_txid(cb)
-        block = {"version": 3, "height": 0, "prev": "0" * 64,
-                 "merkle_root": merkle_root([cb["txid"]]),
-                 "timestamp": 1700000000, "difficulty": self.difficulty,
-                 "nonce": 0, "txs": [cb]}
+        block = {
+            "version": 3, "height": 0, "prev": "0" * 64,
+            "merkle_root": merkle_root([cb["txid"]]),
+            "timestamp": 1700000000, "difficulty": self.difficulty,
+            "nonce": 0, "txs": [cb],
+        }
         while True:
             block["hash"] = compute_block_hash(block)
             if hash_meets_difficulty(block["hash"], self.difficulty):
@@ -877,33 +1024,40 @@ class Blockchain:
         self.db.apply_block(block, [cb])
         self.db.set_meta("genesis_hash", block["hash"])
 
+    # ---------- validação de tx ----------
     def validate_tx(self, tx: dict, *, allow_coinbase: bool = False):
         if not isinstance(tx, dict):
             return False, "tx precisa ser dict"
         if tx.get("coinbase"):
             return (True, "ok") if allow_coinbase else (False, "coinbase proibida")
-        if not {"inputs", "outputs", "timestamp", "nonce"}.issubset(tx):
+        required = {"inputs", "outputs", "timestamp", "nonce",
+                    "from_pubkey", "from_address", "signature"}
+        if not required.issubset(tx):
             return False, "campos faltando"
         if not verify_tx_signature(tx):
             return False, "assinatura inválida"
         if tx.get("txid") != compute_txid(tx):
             return False, "txid não confere"
-        if not tx["inputs"] or not tx["outputs"]:
+        inputs, outputs = tx["inputs"], tx["outputs"]
+        if not inputs or not outputs:
             return False, "inputs/outputs vazios"
-        if len(tx["inputs"]) > 1000 or len(tx["outputs"]) > 1000:
+        if len(inputs) > MAX_INPUTS or len(outputs) > MAX_OUTPUTS:
             return False, "tx grande"
-        seen, total_in = set(), 0
-        for inp in tx["inputs"]:
+
+        seen: set[tuple] = set()
+        total_in = 0
+        for inp in inputs:
             key = (inp.get("txid"), inp.get("vout"))
             if key in seen:
                 return False, "input duplicado"
             seen.add(key)
-            if not self.db.utxo_exists_unspent(inp["txid"], inp["vout"]):
+            row = self.db.utxo_get(inp["txid"], inp["vout"])
+            if row is None or row["spent"]:
                 return False, f"UTXO inexistente: {inp['txid']}:{inp['vout']}"
-            total_in += int(self.db.utxo_get(inp["txid"],
-                                             inp["vout"])["amount"])
+            total_in += int(row["amount"])
+
         total_out = 0
-        for out in tx["outputs"]:
+        for out in outputs:
             if not address_is_valid(out.get("address", "")):
                 return False, "endereço inválido"
             amt = int(out.get("amount", 0))
@@ -914,6 +1068,7 @@ class Blockchain:
             return False, "saldo insuficiente"
         return True, "ok"
 
+    # ---------- submissão de tx ----------
     def submit_tx(self, tx: dict):
         ok, why = self.validate_tx(tx)
         if not ok:
@@ -928,9 +1083,12 @@ class Blockchain:
                             json.dumps(tx, separators=(",", ":")))
         return True, "aceita"
 
+    # ---------- reward ----------
     def _reward(self, h: int) -> int:
-        return 0 if h // HALVING >= 64 else REWARD >> (h // HALVING)
+        epoch = h // HALVING
+        return 0 if epoch >= 64 else REWARD >> epoch
 
+    # ---------- validação de bloco ----------
     def validate_block(self, block: dict):
         tip = self.db.chain_tip()
         if tip is None:
@@ -955,22 +1113,24 @@ class Blockchain:
                 return False, "coinbase duplicada"
         if merkle_root([t["txid"] for t in txs]) != block["merkle_root"]:
             return False, "merkle root inválido"
+
         total_in = total_out = 0
         for tx in txs[1:]:
             ok, why = self.validate_tx(tx)
             if not ok:
                 return False, f"tx inválida: {why}"
             for inp in tx["inputs"]:
-                total_in += int(self.db.utxo_get(inp["txid"],
-                                                 inp["vout"])["amount"])
+                row = self.db.utxo_get(inp["txid"], inp["vout"])
+                total_in += int(row["amount"])
             for out in tx["outputs"]:
                 total_out += int(out["amount"])
-        fees = total_in - total_out
+        fees = max(0, total_in - total_out)
         max_reward = self._reward(block["height"]) + fees
         if sum(int(o["amount"]) for o in txs[0]["outputs"]) > max_reward:
             return False, "coinbase excede recompensa"
         return True, "ok"
 
+    # ---------- add block ----------
     def add_block(self, block: dict):
         ok, why = self.validate_block(block)
         if ok:
@@ -983,12 +1143,14 @@ class Blockchain:
         applied, reason = try_reorg(self, block)
         return (True, reason) if applied else (False, why)
 
+    # ---------- build candidate ----------
     def build_candidate(self, miner: str) -> dict:
         tip = self.db.chain_tip()
         if tip is None:
             raise RuntimeError("sem genesis")
         height = tip["height"] + 1
-        selected, total_in, total_out = [], 0, 0
+        selected: list[dict] = []
+        total_in = total_out = 0
         for row in self.db.mempool_all():
             tx = json.loads(row["raw"])
             ok, _ = self.validate_tx(tx)
@@ -997,80 +1159,208 @@ class Blockchain:
                 continue
             selected.append(tx)
             for inp in tx["inputs"]:
-                total_in += int(self.db.utxo_get(inp["txid"],
-                                                 inp["vout"])["amount"])
+                r = self.db.utxo_get(inp["txid"], inp["vout"])
+                total_in += int(r["amount"])
             for out in tx["outputs"]:
                 total_out += int(out["amount"])
             if len(selected) >= self.max_block_txs - 1:
                 break
-        reward = self._reward(height) + (total_in - total_out)
-        cb = {"coinbase": True, "inputs": [],
-              "outputs": [{"address": miner, "amount": reward}],
-              "timestamp": int(time.time()), "nonce": 0,
-              "from_pubkey": "00" * 33, "from_address": miner,
-              "signature": "00" * 64}
+        reward = self._reward(height) + max(0, total_in - total_out)
+        cb = {
+            "coinbase": True, "inputs": [],
+            "outputs": [{"address": miner, "amount": reward}],
+            "timestamp": int(time.time()), "nonce": 0,
+        }
         cb["txid"] = compute_txid(cb)
         txs = [cb] + selected
-        return {"version": 3, "height": height, "prev": tip["hash"],
-                "merkle_root": merkle_root([t["txid"] for t in txs]),
-                "timestamp": int(time.time()),
-                "difficulty": self.difficulty, "nonce": 0, "txs": txs}
+        return {
+            "version": 3, "height": height, "prev": tip["hash"],
+            "merkle_root": merkle_root([t["txid"] for t in txs]),
+            "timestamp": int(time.time()),
+            "difficulty": self.difficulty, "nonce": 0, "txs": txs,
+        }
 '''.lstrip("\n")
 
 F["brn/reorg.py"] = r'''
+"""Reorganização baseada em chainwork (soma de 2**difficulty)."""
 from __future__ import annotations
 import json
+import logging
+
 from .crypto import compute_block_hash, hash_meets_difficulty
+
+log = logging.getLogger("brn.reorg")
+
+
+def chainwork_of(block_hashes: list[str], db) -> int:
+    """Soma chainwork de uma cadeia (por hashes)."""
+    total = 0
+    for h in block_hashes:
+        row = db.get_block_by_hash(h)
+        if row is None:
+            return -1
+        total += 1 << int(row["difficulty"])
+    return total
 
 
 def try_reorg(chain, new_block: dict):
+    """Aceita bloco se formar cadeia com mais chainwork que a atual."""
     parent = chain.db.get_block_by_hash(new_block.get("prev", ""))
     if parent is None:
         return False, "pai desconhecido"
-    tip = chain.db.chain_tip()
-    if tip is None or parent["height"] + 1 <= tip["height"]:
-        return False, "cadeia não mais longa"
     if not hash_meets_difficulty(compute_block_hash(new_block),
                                  new_block["difficulty"]):
         return False, "dificuldade insuficiente"
-    to_revert = []
+
+    tip = chain.db.chain_tip()
+    if tip is None:
+        return False, "sem tip"
+
+    # Chainwork da nova cadeia = parent + new_block
+    # (aproximação: parent já está na nossa cadeia ou é fork conhecido)
+    parent_work = sum(1 << int(chain.db.get_block(h)["difficulty"])
+                      for h in range(parent["height"] + 1)
+                      if chain.db.get_block(h) is not None)
+    new_work = parent_work + (1 << int(new_block["difficulty"]))
+
+    # Chainwork da cadeia atual
+    cur_work = sum(1 << int(chain.db.get_block(h)["difficulty"])
+                   for h in range(tip["height"] + 1)
+                   if chain.db.get_block(h) is not None)
+
+    if new_work <= cur_work:
+        return False, "chainwork insuficiente"
+
+    # Encontrar ponto de fork
+    fork_h = parent["height"]
+    to_revert: list[dict] = []
     h = tip["height"]
-    while h > parent["height"]:
-        b = chain.db.get_block(h)
-        if b is None:
+    while h > fork_h:
+        row = chain.db.get_block(h)
+        if row is None:
             break
-        to_revert.append(json.loads(b["raw"]))
+        to_revert.append(json.loads(row["raw"]))
         h -= 1
-    for b in to_revert:
-        chain.db.revert_block(b)
+
+    # Reverter e aplicar
     try:
+        for b in to_revert:
+            chain.db.revert_block(b)
         chain.db.apply_block(new_block, new_block["txs"])
+        log.info("reorg.applied", extra={"extra_fields": {
+            "fork_height": fork_h, "new_height": new_block["height"],
+            "reverted": len(to_revert)}})
+        return True, f"reorg aplicado (fork em #{fork_h})"
     except Exception as e:
+        # rollback
         for b in reversed(to_revert):
-            chain.db.apply_block(b, b["txs"])
+            try:
+                chain.db.apply_block(b, b["txs"])
+            except Exception:
+                pass
         return False, f"reorg falhou: {e}"
-    return True, "reorg aplicado"
 '''.lstrip("\n")
 
 F["brn/miner.py"] = r'''
 from __future__ import annotations
+import logging
 import time
+
 from .blockchain import Blockchain
 from .crypto import compute_block_hash, hash_meets_difficulty
+
+log = logging.getLogger("brn.miner")
 
 
 def mine(chain: Blockchain, miner: str, *,
          max_seconds: float | None = None) -> dict | None:
     block = chain.build_candidate(miner)
     t0 = time.time()
+    attempts = 0
     while True:
         block["hash"] = compute_block_hash(block)
         if hash_meets_difficulty(block["hash"], block["difficulty"]):
-            ok, _ = chain.add_block(block)
+            ok, why = chain.add_block(block)
+            log.info("mine.ok", extra={"extra_fields": {
+                "height": block["height"], "nonce": block["nonce"],
+                "attempts": attempts, "hash": block["hash"][:16]}})
             return block if ok else None
         block["nonce"] += 1
-        if max_seconds and time.time() - t0 > max_seconds:
+        attempts += 1
+        if max_seconds and (time.time() - t0) > max_seconds:
+            log.warning("mine.timeout", extra={"extra_fields": {
+                "attempts": attempts, "max_seconds": max_seconds}})
             return None
+'''.lstrip("\n")
+
+F["brn/metrics.py"] = r'''
+from __future__ import annotations
+from prometheus_client import (CONTENT_TYPE_LATEST, Counter, Gauge,
+                               Histogram, generate_latest)
+
+BLOCKS_MINED = Counter("brn_blocks_mined_total", "Blocos minerados")
+TXS_ACCEPTED = Counter("brn_txs_accepted_total", "Txs aceitas")
+TXS_REJECTED = Counter("brn_txs_rejected_total", "Txs rejeitadas", ["reason"])
+PEERS = Gauge("brn_peers", "Peers conectados")
+HEIGHT = Gauge("brn_chain_height", "Altura")
+MEMPOOL = Gauge("brn_mempool_size", "Txs na mempool")
+SUPPLY = Gauge("brn_supply", "Supply total (satoshis)")
+REQ_LATENCY = Histogram("brn_request_seconds", "Latência", ["endpoint"])
+
+
+def update_gauges(chain, peers_count: int) -> None:
+    tip = chain.db.chain_tip()
+    HEIGHT.set(tip["height"] if tip else 0)
+    MEMPOOL.set(chain.db.mempool_size())
+    PEERS.set(peers_count)
+    SUPPLY.set(chain.db.supply())
+
+
+def render():
+    return generate_latest(), CONTENT_TYPE_LATEST
+'''.lstrip("\n")
+
+F["brn/ngrok_tunnel.py"] = r'''
+"""Túnel NGROK opcional. NUNCA contém token em código."""
+from __future__ import annotations
+import logging
+
+from .secure_token import SecureToken
+
+log = logging.getLogger("brn.ngrok")
+
+
+class NgrokTunnel:
+    def __init__(self, token: SecureToken, target: str,
+                 domain: str | None = None):
+        self._token = token
+        self._target = target
+        self._domain = domain
+        self._listener = None
+
+    def start(self) -> str:
+        try:
+            import ngrok
+        except ImportError as e:
+            raise RuntimeError("Instale: pip install ngrok==1.4.0") from e
+        kwargs = {"authtoken": self._token.value(), "schemes": ["https"]}
+        if self._domain:
+            kwargs["domain"] = self._domain
+        self._listener = ngrok.forward(self._target, **kwargs)
+        url = self._listener.url()
+        log.warning("ngrok.up", extra={"extra_fields": {
+            "public_url": url, "local": self._target,
+            "note": "X-API-Token obrigatório em /api/*"}})
+        return url
+
+    def close(self):
+        if self._listener is not None:
+            try:
+                self._listener.close()
+                log.info("ngrok.down")
+            except Exception as e:
+                log.warning("ngrok.close_failed",
+                            extra={"extra_fields": {"err": str(e)}})
 '''.lstrip("\n")
 
 F["brn/explorer.py"] = r'''
@@ -1079,7 +1369,8 @@ import hmac
 import time
 from functools import wraps
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import (Flask, Response, g, jsonify, render_template_string,
+                   request)
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
@@ -1088,7 +1379,8 @@ from .blockchain import Blockchain
 from .config import Settings
 from .crypto import address_is_valid
 from .logging_setup import new_request_id
-from .metrics import REQ_LATENCY, TXS_ACCEPTED, TXS_REJECTED, render, update_gauges
+from .metrics import (REQ_LATENCY, TXS_ACCEPTED, TXS_REJECTED, render,
+                      update_gauges)
 from .secure_token import SecureToken
 
 INDEX_HTML = """<!DOCTYPE html>
@@ -1128,12 +1420,17 @@ code{background:#21262d;padding:2px 6px;border-radius:4px;color:#79c0ff}
 
 def create_app(cfg: Settings, chain: Blockchain, api_token: SecureToken,
                peers_getter=lambda: 0) -> Flask:
+    if not api_token.value():
+        raise RuntimeError("API token vazio — obrigatório para explorer")
+
     app = Flask(__name__)
     Talisman(app, force_https=cfg.public_tunnel,
              strict_transport_security=cfg.public_tunnel,
              session_cookie_secure=cfg.public_tunnel,
-             content_security_policy={"default-src": "'self'",
-                                      "style-src": "'self' 'unsafe-inline'"})
+             content_security_policy={
+                 "default-src": "'self'",
+                 "style-src": "'self' 'unsafe-inline'",
+             })
     limiter = Limiter(get_remote_address, app=app,
                       default_limits=[cfg.rate_limit])
 
@@ -1183,8 +1480,8 @@ def create_app(cfg: Settings, chain: Blockchain, api_token: SecureToken,
         b = _j.loads(row["raw"])
         rows = "".join(
             f"<tr><td><code>{t['txid'][:20]}…</code></td>"
-            f"<td>{t.get('from_address','—')[:16]}…</td>"
-            f"<td>{sum(o['amount'] for o in t.get('outputs',[])) if t.get('outputs') else 0}</td></tr>"
+            f"<td>{(t.get('from_address') or '—')[:16]}…</td>"
+            f"<td>{sum(o['amount'] for o in t.get('outputs', []))}</td></tr>"
             for t in b.get("txs", []))
         html = (
             "<html><body style='font-family:system-ui;background:#0d1117;"
@@ -1279,77 +1576,329 @@ def create_app(cfg: Settings, chain: Blockchain, api_token: SecureToken,
     return app
 '''.lstrip("\n")
 
-F["brn/metrics.py"] = r'''
+# ============================================================ P2P
+F["brn/p2p.py"] = r'''
+"""P2P autenticado — framing binário (length-prefix) + HMAC handshake.
+
+Protocolo:
+  1. Conexão TCP crua
+  2. Ambas as partes enviam `hello` com nonce de 16 bytes aleatórios
+  3. Ambas calculam HMAC(network_key, nonce_self || nonce_peer || DOMAIN_P2P)
+  4. Ambas enviam `auth` com o HMAC
+  5. Ambas verificam em tempo constante
+  6. Loop: inv/get_block, inv_tx/get_tx, ping/pong
+"""
 from __future__ import annotations
-from prometheus_client import (CONTENT_TYPE_LATEST, Counter, Gauge,
-                               Histogram, generate_latest)
-
-BLOCKS_MINED = Counter("brn_blocks_mined_total", "Blocos minerados")
-TXS_ACCEPTED = Counter("brn_txs_accepted_total", "Txs aceitas")
-TXS_REJECTED = Counter("brn_txs_rejected_total", "Txs rejeitadas", ["reason"])
-PEERS = Gauge("brn_peers", "Peers conectados")
-HEIGHT = Gauge("brn_chain_height", "Altura")
-MEMPOOL = Gauge("brn_mempool_size", "Txs na mempool")
-REQ_LATENCY = Histogram("brn_request_seconds", "Latência", ["endpoint"])
-
-
-def update_gauges(chain, peers_count: int) -> None:
-    tip = chain.db.chain_tip()
-    HEIGHT.set(tip["height"] if tip else 0)
-    MEMPOOL.set(chain.db.mempool_size())
-    PEERS.set(peers_count)
-
-
-def render():
-    return generate_latest(), CONTENT_TYPE_LATEST
-'''.lstrip("\n")
-
-F["brn/ngrok_tunnel.py"] = r'''
-"""Túnel NGROK opcional. NUNCA contém token em código."""
-from __future__ import annotations
+import asyncio
+import hashlib
+import hmac
+import json
 import logging
+import os
+import struct
+import time
+from typing import Callable
 
-from .secure_token import SecureToken
+from .constants import (DOMAIN_P2P, P2P_HANDSHAKE_TIMEOUT, P2P_MAX_MSG,
+                        P2P_MAX_PEERS, P2P_PEER_TIMEOUT, P2P_PING_INTERVAL,
+                        P2P_READ_TIMEOUT, PROTOCOL_VERSION)
 
-log = logging.getLogger("brn.ngrok")
+log = logging.getLogger("brn.p2p")
 
 
-class NgrokTunnel:
-    def __init__(self, token: SecureToken, target: str,
-                 domain: str | None = None):
-        self._token = token
-        self._target = target
-        self._domain = domain
-        self._listener = None
+def _hmac(network_key_hex: str, data: bytes) -> bytes:
+    key = bytes.fromhex(network_key_hex)
+    return hmac.new(key, DOMAIN_P2P + data, hashlib.sha256).digest()
 
-    def start(self) -> str:
+
+class Peer:
+    __slots__ = ("reader", "writer", "addr", "last_seen", "height",
+                 "protocol", "outbound", "send_lock")
+
+    def __init__(self, reader, writer, addr, outbound: bool):
+        self.reader = reader
+        self.writer = writer
+        self.addr = addr
+        self.outbound = outbound
+        self.last_seen = time.time()
+        self.height = 0
+        self.protocol = 0
+        self.send_lock = asyncio.Lock()
+
+    @property
+    def key(self) -> str:
+        return f"{self.addr[0]}:{self.addr[1]}"
+
+    def touch(self):
+        self.last_seen = time.time()
+
+    async def send(self, msg: dict):
+        body = json.dumps(msg, separators=(",", ":")).encode()
+        if len(body) > P2P_MAX_MSG:
+            raise ValueError("mensagem grande")
+        frame = struct.pack(">I", len(body)) + body
+        async with self.send_lock:
+            self.writer.write(frame)
+            await self.writer.drain()
+
+    async def recv(self) -> dict | None:
         try:
-            import ngrok
-        except ImportError as e:
-            raise RuntimeError("Instale: pip install ngrok==1.4.0") from e
-        kwargs = {"authtoken": self._token.value(), "schemes": ["https"]}
-        if self._domain:
-            kwargs["domain"] = self._domain
-        self._listener = ngrok.forward(self._target, **kwargs)
-        url = self._listener.url()
-        log.warning("ngrok.up", extra={"extra_fields": {
-            "public_url": url, "local": self._target,
-            "note": "X-API-Token obrigatório em /api/*"}})
-        return url
+            hdr = await asyncio.wait_for(self.reader.readexactly(4),
+                                          timeout=P2P_READ_TIMEOUT)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            return None
+        n = struct.unpack(">I", hdr)[0]
+        if n == 0 or n > P2P_MAX_MSG:
+            return None
+        try:
+            body = await asyncio.wait_for(self.reader.readexactly(n),
+                                           timeout=P2P_READ_TIMEOUT)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            return None
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return None
 
-    def close(self):
-        if self._listener is not None:
+    async def close(self):
+        try:
+            self.writer.close()
+            await self.writer.wait_closed()
+        except Exception:
+            pass
+
+
+class P2PServer:
+    def __init__(self, chain, cfg, on_block: Callable[[dict], None],
+                 on_tx: Callable[[dict], None]):
+        self.chain = chain
+        self.cfg = cfg
+        self.on_block = on_block
+        self.on_tx = on_tx
+        self.peers: dict[str, Peer] = {}
+        self._stop = asyncio.Event()
+        self._server: asyncio.AbstractServer | None = None
+        self._tasks: list[asyncio.Task] = []
+
+    # ---------- handshake ----------
+    async def _handshake(self, peer: Peer) -> bool:
+        if not self.cfg.network_key:
+            log.error("p2p.no_key")
+            return False
+        my_nonce = os.urandom(16)
+        await peer.send({"t": "hello", "v": PROTOCOL_VERSION,
+                         "n": self.cfg.network, "nonce": my_nonce.hex()})
+        try:
+            msg = await asyncio.wait_for(peer.recv(), timeout=P2P_HANDSHAKE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+        if not msg or msg.get("t") != "hello":
+            return False
+        if msg.get("n") != self.cfg.network:
+            log.warning("p2p.wrong_network",
+                        extra={"extra_fields": {"got": msg.get("n")}})
+            return False
+        try:
+            peer_nonce = bytes.fromhex(msg["nonce"])
+        except (KeyError, ValueError):
+            return False
+        if len(peer_nonce) != 16:
+            return False
+        my_sig = _hmac(self.cfg.network_key, my_nonce + peer_nonce)
+        await peer.send({"t": "auth", "sig": my_sig.hex()})
+        try:
+            ack = await asyncio.wait_for(peer.recv(), timeout=P2P_HANDSHAKE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+        if not ack or ack.get("t") != "auth":
+            return False
+        try:
+            their_sig = bytes.fromhex(ack["sig"])
+        except (KeyError, ValueError):
+            return False
+        expected = _hmac(self.cfg.network_key, peer_nonce + my_nonce)
+        if not hmac.compare_digest(their_sig, expected):
+            log.warning("p2p.auth_fail", extra={"extra_fields": {
+                "addr": peer.key}})
+            return False
+        peer.height = int(msg.get("h", 0))
+        peer.protocol = int(msg.get("v", 0))
+        return True
+
+    # ---------- handler ----------
+    async def _handle(self, reader, writer):
+        addr = writer.get_extra_info("peername") or ("?", 0)
+        peer = Peer(reader, writer, addr, outbound=False)
+        try:
+            if not await self._handshake(peer):
+                return
+            if len(self.peers) >= P2P_MAX_PEERS:
+                return
+            self.peers[peer.key] = peer
+            log.info("p2p.peer_in", extra={"extra_fields": {
+                "addr": peer.key, "height": peer.height}})
+            await self._peer_loop(peer)
+        except Exception as e:
+            log.warning("p2p.handle_error",
+                        extra={"extra_fields": {"err": str(e)}})
+        finally:
+            self.peers.pop(peer.key, None)
+            await peer.close()
+            log.info("p2p.peer_out", extra={"extra_fields": {"addr": peer.key}})
+
+    async def _peer_loop(self, peer: Peer):
+        while not self._stop.is_set():
+            msg = await peer.recv()
+            if msg is None:
+                return
+            peer.touch()
             try:
-                self._listener.close()
-                log.info("ngrok.down")
+                await self._dispatch(msg, peer)
             except Exception as e:
-                log.warning("ngrok.close_failed",
-                            extra={"extra_fields": {"err": str(e)}})
+                log.warning("p2p.dispatch_error", extra={"extra_fields": {
+                    "addr": peer.key, "err": str(e)}})
+
+    async def _dispatch(self, msg: dict, peer: Peer):
+        t = msg.get("t")
+        if t == "ping":
+            await peer.send({"t": "pong", "h": self.chain.db.chain_tip()["height"]
+                             if self.chain.db.chain_tip() else 0})
+        elif t == "pong":
+            peer.height = int(msg.get("h", peer.height))
+        elif t == "inv_block":
+            bh = msg.get("h")
+            if bh and not self.chain.db.get_block(bh):
+                await peer.send({"t": "get_block", "h": bh})
+        elif t == "get_block":
+            h = int(msg.get("h", -1))
+            row = self.chain.db.get_block(h)
+            if row:
+                import json as _j
+                await peer.send({"t": "block", "block": _j.loads(row["raw"])})
+        elif t == "block":
+            block = msg.get("block")
+            if isinstance(block, dict):
+                try:
+                    self.on_block(block)
+                except Exception as e:
+                    log.warning("p2p.on_block_error",
+                                extra={"extra_fields": {"err": str(e)}})
+        elif t == "inv_tx":
+            txid = msg.get("txid")
+            if txid and not self.chain.db.mempool_contains(txid):
+                await peer.send({"t": "get_tx", "txid": txid})
+        elif t == "get_tx":
+            txid = msg.get("txid")
+            if txid:
+                for row in self.chain.db.mempool_all():
+                    if row["txid"] == txid:
+                        import json as _j
+                        await peer.send({"t": "tx", "tx": _j.loads(row["raw"])})
+                        break
+        elif t == "tx":
+            tx = msg.get("tx")
+            if isinstance(tx, dict):
+                try:
+                    self.on_tx(tx)
+                except Exception as e:
+                    log.warning("p2p.on_tx_error",
+                                extra={"extra_fields": {"err": str(e)}})
+
+    # ---------- broadcast ----------
+    async def broadcast(self, msg: dict, exclude: str | None = None):
+        if not self.peers:
+            return
+        dead: list[str] = []
+        for key, peer in list(self.peers.items()):
+            if exclude and key == exclude:
+                continue
+            try:
+                await peer.send(msg)
+            except Exception:
+                dead.append(key)
+        for k in dead:
+            p = self.peers.pop(k, None)
+            if p:
+                await p.close()
+
+    # ---------- outbound connect ----------
+    async def connect(self, host: str, port: int):
+        key = f"{host}:{port}"
+        if key in self.peers:
+            return False
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=P2P_HANDSHAKE_TIMEOUT)
+        except Exception as e:
+            log.debug("p2p.connect_fail", extra={"extra_fields": {
+                "host": host, "port": port, "err": str(e)}})
+            return False
+        peer = Peer(reader, writer, (host, port), outbound=True)
+        if not await self._handshake(peer):
+            await peer.close()
+            return False
+        self.peers[key] = peer
+        log.info("p2p.peer_out", extra={"extra_fields": {
+            "addr": peer.key, "height": peer.height}})
+        self._tasks.append(asyncio.create_task(self._peer_loop(peer)))
+        return True
+
+    # ---------- maintenance ----------
+    async def _maintenance(self):
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(),
+                                       timeout=P2P_PING_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now = time.time()
+            for key, peer in list(self.peers.items()):
+                if now - peer.last_seen > P2P_PEER_TIMEOUT:
+                    log.info("p2p.timeout", extra={"extra_fields": {"addr": key}})
+                    self.peers.pop(key, None)
+                    await peer.close()
+                    continue
+                try:
+                    tip = self.chain.db.chain_tip()
+                    await peer.send({"t": "ping",
+                                     "h": tip["height"] if tip else 0})
+                except Exception:
+                    self.peers.pop(key, None)
+                    await peer.close()
+
+    # ---------- lifecycle ----------
+    async def start(self):
+        self._server = await asyncio.start_server(
+            self._handle, self.cfg.p2p_host, self.cfg.p2p_port)
+        log.info("p2p.listen", extra={"extra_fields": {
+            "host": self.cfg.p2p_host, "port": self.cfg.p2p_port}})
+        self._tasks.append(asyncio.create_task(self._maintenance()))
+        for host, port in self.cfg.seeds_list:
+            asyncio.create_task(self.connect(host, port))
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def stop(self):
+        self._stop.set()
+        for peer in list(self.peers.values()):
+            await peer.close()
+        self.peers.clear()
+        for t in self._tasks:
+            t.cancel()
+        if self._server:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception:
+                pass
 '''.lstrip("\n")
 
+# ============================================================ CLI
 F["brn/cli.py"] = r'''
 from __future__ import annotations
 import argparse
+import asyncio
 import getpass
 import signal
 import sys
@@ -1366,6 +1915,7 @@ from .hdwallet import HDWallet
 from .logging_setup import setup as setup_logging
 from .miner import mine
 from .ngrok_tunnel import NgrokTunnel
+from .p2p import P2PServer
 from .secure_token import SecureToken, load_or_create_api_token
 from .storage import Storage
 from .wallet import Wallet, load, save
@@ -1376,6 +1926,7 @@ def _chain(cfg):
     return db, Blockchain(db, difficulty=cfg.difficulty)
 
 
+# ---------- wallet ----------
 def cmd_wallet_new(args):
     p = Path(args.path)
     if p.exists():
@@ -1393,6 +1944,7 @@ def cmd_wallet_show(args):
     print(f"Endereço: {w.address}\nPubkey: {w.public_key.hex()}")
 
 
+# ---------- HD wallet ----------
 def cmd_hd_new(args):
     hd = HDWallet.create()
     print("Mnemônico (GUARDE):", hd.mnemonic)
@@ -1402,7 +1954,8 @@ def cmd_hd_new(args):
 
 
 def cmd_hd_derive(args):
-    hd = HDWallet.from_mnemonic(getpass.getpass("Mnemônico: ").strip())
+    m = getpass.getpass("Mnemônico: ").strip()
+    hd = HDWallet.from_mnemonic(m)
     priv, addr, path = hd.derive(account=args.account, change=args.change,
                                  index=args.index)
     print(f"{path}\n{addr}")
@@ -1410,6 +1963,7 @@ def cmd_hd_derive(args):
         print(f"PRIV: {priv.hex()}")
 
 
+# ---------- chain ----------
 def cmd_init(args):
     cfg = load_settings()
     db, chain = _chain(cfg)
@@ -1425,8 +1979,11 @@ def cmd_mine(args):
     cfg = load_settings()
     db, chain = _chain(cfg)
     try:
-        b = mine(chain, args.address)
-        print(f"Bloco: {b['height']} {b['hash']}" if b else "Não aceito")
+        b = mine(chain, args.address, max_seconds=args.max_seconds)
+        if b:
+            print(f"Bloco: {b['height']} {b['hash']}")
+        else:
+            print("Não aceito ou timeout")
     finally:
         db.close()
 
@@ -1437,7 +1994,11 @@ def cmd_checkpoint(args):
     try:
         priv = bytes.fromhex(getpass.getpass("Priv do assinante: ").strip())
         ck = make_checkpoint(chain, priv, pubkey_from_priv(priv))
-        print(f"Checkpoint: altura={ck['height']} hash={ck['hash'][:16]}…")
+        if ck:
+            print(f"Checkpoint: altura={ck['height']} "
+                  f"hash={ck['hash'][:16]}…")
+        else:
+            print("Sem blocos")
     finally:
         db.close()
 
@@ -1451,40 +2012,114 @@ def cmd_balance(args):
         db.close()
 
 
+# ---------- node ----------
+class _NodeRunner:
+    def __init__(self, cfg, chain, on_block):
+        self.cfg = cfg
+        self.chain = chain
+        self.on_block = on_block
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.p2p: P2PServer | None = None
+        self._thread: threading.Thread | None = None
+        self._stop: asyncio.Event | None = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="p2p")
+        self._thread.start()
+
+    def _run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._main())
+        except Exception as e:
+            print(f"[p2p] erro: {e}")
+        finally:
+            try:
+                self.loop.close()
+            except Exception:
+                pass
+
+    async def _main(self):
+        self._stop = asyncio.Event()
+        self.p2p = P2PServer(self.chain, self.cfg,
+                             on_block=self.on_block,
+                             on_tx=self._on_tx)
+        try:
+            await self.p2p.start()
+        except asyncio.CancelledError:
+            pass
+
+    def _on_tx(self, tx: dict):
+        try:
+            self.chain.submit_tx(tx)
+        except Exception:
+            pass
+
+    def stop(self):
+        if self.p2p and self.loop:
+            try:
+                asyncio.run_coroutine_threadsafe(self.p2p.stop(), self.loop)
+            except Exception:
+                pass
+
+
 def cmd_node(args):
     cfg = load_settings()
     setup_logging(cfg.log_level)
     db, chain = _chain(cfg)
+
+    # genesis
     if args.genesis_address:
         chain.ensure_genesis(args.genesis_address)
+    elif db.chain_tip() is None:
+        sys.exit("Nó sem genesis. Use --genesis-address <endereço>.")
 
-    api_token = load_or_create_api_token(cfg.data_dir)
-    print(f"API token do explorador: {api_token.value()}")
-    print("  (exigido como header X-API-Token em /api/*)")
-
-    app = create_app(cfg, chain, api_token, peers_getter=lambda: 0)
-    from werkzeug.serving import make_server
-    srv = make_server(cfg.explorer_host, cfg.explorer_port, app, threaded=True)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    local_url = f"http://{cfg.explorer_host}:{cfg.explorer_port}"
-    print(f"Explorador local: {local_url}")
-
-    tunnel = None
-    if args.ngrok:
-        ngrok_token = SecureToken.load(
-            "NGROK_AUTHTOKEN",
-            env_file=Path(".env"),
-            prompt="Cole o NGROK_AUTHTOKEN (não será exibido): ")
-        tunnel = NgrokTunnel(ngrok_token, local_url,
-                             domain=args.domain or None)
+    # p2p em background
+    def _on_block(blk: dict):
         try:
-            url = tunnel.start()
-            print(f"\n⚠️  Explorador público: {url}")
-            print("   /api/* exige X-API-Token. Rotacione o NGROK authtoken "
-                  "se já foi exposto.\n")
+            chain.add_block(blk)
         except Exception as e:
-            print(f"Falha NGROK: {e}")
+            print(f"[p2p] add_block falhou: {e}")
 
+    runner = _NodeRunner(cfg, chain, _on_block)
+    runner.start()
+
+    # explorer opcional
+    srv = None
+    tunnel = None
+    if args.with_explorer:
+        api_token = load_or_create_api_token(cfg.data_dir)
+        print(f"API token: {api_token.value()}")
+        app = create_app(cfg, chain, api_token,
+                         peers_getter=lambda: len(
+                             runner.p2p.peers) if runner.p2p else 0)
+        from werkzeug.serving import make_server
+        srv = make_server(cfg.explorer_host, cfg.explorer_port, app,
+                          threaded=True)
+        threading.Thread(target=srv.serve_forever, daemon=True,
+                         name="explorer").start()
+        local_url = f"http://{cfg.explorer_host}:{cfg.explorer_port}"
+        print(f"Explorador local: {local_url}")
+
+        if args.ngrok:
+            try:
+                ngrok_token = SecureToken.load(
+                    "NGROK_AUTHTOKEN", env_file=Path(".env"),
+                    prompt="NGROK_AUTHTOKEN (não exibido): ")
+                tunnel = NgrokTunnel(ngrok_token, local_url,
+                                     domain=args.domain or None)
+                url = tunnel.start()
+                print(f"\n⚠️  Explorador público: {url}")
+                print("   /api/* exige X-API-Token. Rotacione o token se "
+                      "já foi exposto.\n")
+            except Exception as e:
+                print(f"Falha NGROK: {e}")
+    else:
+        print("[node] explorer desativado (--with-explorer para ativar)")
+
+    # mineração opcional
     stop = threading.Event()
 
     def _sig(signum, _frame):
@@ -1496,39 +2131,76 @@ def cmd_node(args):
         except (ValueError, OSError):
             pass
 
+    if args.mine_to:
+        def _miner():
+            while not stop.is_set():
+                try:
+                    mine(chain, args.mine_to, max_seconds=60)
+                except Exception as e:
+                    print(f"[miner] erro: {e}")
+                    time.sleep(2)
+        threading.Thread(target=_miner, daemon=True, name="miner").start()
+        print(f"[node] minerando para {args.mine_to}")
+
     print("Ctrl+C para encerrar.")
     try:
         while not stop.is_set():
             time.sleep(0.5)
     finally:
+        runner.stop()
         if tunnel:
             tunnel.close()
-        srv.shutdown()
+        if srv:
+            srv.shutdown()
         db.close()
 
 
+# ---------- main ----------
 def main():
     p = argparse.ArgumentParser(prog="brn")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("wallet-new"); s.add_argument("path"); s.set_defaults(func=cmd_wallet_new)
-    s = sub.add_parser("wallet-show"); s.add_argument("path"); s.set_defaults(func=cmd_wallet_show)
-    s = sub.add_parser("hd-new"); s.set_defaults(func=cmd_hd_new)
+    s = sub.add_parser("wallet-new")
+    s.add_argument("path")
+    s.set_defaults(func=cmd_wallet_new)
+
+    s = sub.add_parser("wallet-show")
+    s.add_argument("path")
+    s.set_defaults(func=cmd_wallet_show)
+
+    s = sub.add_parser("hd-new")
+    s.set_defaults(func=cmd_hd_new)
+
     s = sub.add_parser("hd-derive")
     s.add_argument("--account", type=int, default=0)
     s.add_argument("--change", type=int, default=0)
     s.add_argument("--index", type=int, default=0)
     s.add_argument("--reveal", action="store_true")
     s.set_defaults(func=cmd_hd_derive)
-    s = sub.add_parser("init"); s.add_argument("address"); s.set_defaults(func=cmd_init)
-    s = sub.add_parser("mine"); s.add_argument("address"); s.set_defaults(func=cmd_mine)
-    s = sub.add_parser("balance"); s.add_argument("address"); s.set_defaults(func=cmd_balance)
-    s = sub.add_parser("checkpoint"); s.set_defaults(func=cmd_checkpoint)
+
+    s = sub.add_parser("init")
+    s.add_argument("address")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("mine")
+    s.add_argument("address")
+    s.add_argument("--max-seconds", type=float, default=None)
+    s.set_defaults(func=cmd_mine)
+
+    s = sub.add_parser("balance")
+    s.add_argument("address")
+    s.set_defaults(func=cmd_balance)
+
+    s = sub.add_parser("checkpoint")
+    s.set_defaults(func=cmd_checkpoint)
+
     s = sub.add_parser("node")
     s.add_argument("--genesis-address", default=None)
     s.add_argument("--with-explorer", action="store_true")
     s.add_argument("--ngrok", action="store_true")
     s.add_argument("--domain", default=None)
+    s.add_argument("--mine-to", default=None,
+                   help="Endereço que recebe recompensa de mineração")
     s.set_defaults(func=cmd_node)
 
     args = p.parse_args()
@@ -1662,7 +2334,8 @@ F["tests/test_blockchain.py"] = r'''
 import tempfile
 from pathlib import Path
 from brn.blockchain import Blockchain
-from brn.crypto import generate_private_key, pubkey_from_priv, pubkey_to_address
+from brn.crypto import (generate_private_key, pubkey_from_priv,
+                        pubkey_to_address)
 from brn.miner import mine
 from brn.storage import Storage
 
@@ -1684,13 +2357,13 @@ def test_genesis():
 
 def test_mine():
     c, addr = _chain()
-    assert mine(c, addr) is not None
+    assert mine(c, addr, max_seconds=5) is not None
     assert c.db.chain_tip()["height"] == 1
 
 
 def test_utxo_atomicity():
     c, addr = _chain()
-    mine(c, addr)
+    mine(c, addr, max_seconds=5)
     u = c.db.utxos_of(addr)[0]
     with c.db.tx() as conn:
         cur = conn.execute(
@@ -1701,6 +2374,42 @@ def test_utxo_atomicity():
             "UPDATE utxos SET spent=1 WHERE txid=? AND vout=? AND spent=0",
             (u["txid"], u["vout"]))
         assert cur.rowcount == 0
+
+
+def test_balance_and_supply():
+    c, addr = _chain()
+    mine(c, addr, max_seconds=5)
+    mine(c, addr, max_seconds=5)
+    assert c.db.balance_of(addr) > 0
+    assert c.db.supply() > 0
+'''.lstrip("\n")
+
+F["tests/test_reorg.py"] = r'''
+import tempfile
+from pathlib import Path
+from brn.blockchain import Blockchain
+from brn.crypto import (generate_private_key, pubkey_from_priv,
+                        pubkey_to_address)
+from brn.miner import mine
+from brn.storage import Storage
+
+
+def _chain():
+    d = tempfile.mkdtemp()
+    db = Storage(Path(d) / "t.db")
+    c = Blockchain(db, difficulty=2, max_block_txs=20)
+    priv = generate_private_key()
+    addr = pubkey_to_address(pubkey_from_priv(priv))
+    c.ensure_genesis(addr)
+    return c, addr
+
+
+def test_mine_extends():
+    c, addr = _chain()
+    b1 = mine(c, addr, max_seconds=5)
+    b2 = mine(c, addr, max_seconds=5)
+    assert b1 and b2
+    assert b2["prev"] == b1["hash"]
 '''.lstrip("\n")
 
 # ============================================================ infra
@@ -1721,7 +2430,7 @@ ENV BRN_DATA_DIR=/var/lib/brn
 EXPOSE 6001 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -fs http://127.0.0.1:8080/health || exit 1
-ENTRYPOINT ["python", "-m", "brn.cli"]
+ENTRYPOINT ["python", "-m", "brn"]
 CMD ["node", "--with-explorer"]
 '''.lstrip("\n")
 
@@ -1781,10 +2490,13 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -r requirements-dev.txt
       - run: ruff check brn tests
+      - run: mypy brn || true
       - run: pytest -q --cov=brn
       - run: bandit -r brn -ll
       - run: pip-audit -r requirements.txt
       - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: fs
@@ -1793,29 +2505,30 @@ jobs:
 '''.lstrip("\n")
 
 F["README.md"] = r'''
-# BRN Produção v3
+# BRN Produção v3.1
 
-Blockchain + explorador de blocos com NGROK seguro.
+Blockchain UTXO + explorador com NGROK seguro, P2P autenticado e CI.
 
-## Segurança
+## Componentes
 
-- Argon2id + AES-256-GCM (carteira em repouso, chmod 0600)
-- HD wallet BIP-39/32/44
-- Schnorr BIP-340 com domínio de protocolo
-- NGROK token **nunca** em código (env / .env / prompt)
-- API token obrigatório em todas as rotas `/api/*`
-- Rate limit, CSP, HSTS
-- `/metrics` e `/ready` protegidos por token
-- Double-spend atômico no SQLite
-- Docker non-root, read-only, cap_drop ALL
-- CI: ruff + pytest + bandit + pip-audit + gitleaks + trivy
+- **UTXO** com gasto atômico no SQLite
+- **PoW** com dificuldade ajustável
+- **P2P** autenticado via HMAC-SHA256 (`network_key`)
+- **HD wallet** BIP-39/32/44 (coin 960)
+- **Carteira** Argon2id + AES-256-GCM (chmod 0600)
+- **Explorador** Flask + rate-limit + CSP + HSTS + `X-API-Token`
+- **NGROK** opcional (token nunca em código)
+- **Checkpoints** assinados (Schnorr BIP-340)
+- **Reorg** por chainwork
+- **Métricas** Prometheus em `/metrics`
+- **Docker** non-root, read-only, cap_drop ALL
 
-## Setup
+## Setup rápido
 
 ```bash
 cp .env.example .env
-make key        # cole BRN_NETWORK_KEY no .env
-make api-token  # cole BRN_API_TOKEN no .env
+make key          # cole BRN_NETWORK_KEY no .env
+make api-token    # cole BRN_API_TOKEN no .env
 # opcional:
 echo "NGROK_AUTHTOKEN=seu-token-novo" >> .env
 chmod 600 .env
@@ -1823,4 +2536,3 @@ chmod 600 .env
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 make ci
-python -m brn.cli node --with-explorer
