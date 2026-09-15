@@ -1,298 +1,222 @@
 """
-BRN Node — Blockchain PoW + P2P + AMM (BRN/USDC) + Mineração.
-Junta: bruno_blockchain_real.py + p2p.py + cripto_wallet + assets.
+main.py — CLI interativa sobre o Node (P2P + PoW + CLOB + MEV + NGROK).
 """
-import asyncio
+import json
 import os
 import sys
 import time
-import json
 
-from bruno_blockchain_real import (
-    Blockchain, Transaction, NATIVE_ASSET, DB_PATH,
-)
-from p2p import PeerManager
-
-try:
-    from cripto_wallet import WalletManager
-except ImportError:
-    WalletManager = None
+from node import Node, BASE, QUOTE
 
 
 # =====================================================================
-# Configuração (via variáveis de ambiente)
+# Cabeçalho com URL do NGROK
 # =====================================================================
-PORT             = int(os.environ.get("BRN_P2P_PORT", "6001"))
-MINER_INTERVAL   = float(os.environ.get("BRN_MINER_INTERVAL", "0.5"))
-STATUS_INTERVAL  = float(os.environ.get("BRN_STATUS_INTERVAL", "15"))
-MINER_ENABLED    = os.environ.get("BRN_MINE", "1") == "1"
-INTERACTIVE      = os.environ.get("BRN_INTERACTIVE", "0") == "1"
+def wait_ngrok(node: Node, timeout: float = 10.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if node.public_endpoint:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def print_header(node: Node):
+    print("=" * 72)
+    print(" BRN Node — CLI interativa (CLOB + MEV + PoW + P2P)")
+    print("=" * 72)
+    print(f" Endereço:       {node.identity['address']}")
+    print(f" Porta P2P:      {node.pm.port}")
+    print(f" Par padrão:     {BASE}/{QUOTE}")
+    print(f" Minerando:      {'sim' if node.enable_miner else 'não'}")
+    if node.public_endpoint:
+        h, p = node.public_endpoint
+        print(f" Endpoint NGROK: {h}:{p}")
+        print(f" Peers devem usar:")
+        print(f"   BRN_HARDCODED_SEEDS={h}:{p}")
+    elif os.environ.get("BRN_NGROK", "0") == "1":
+        print(f" Endpoint NGROK: aguardando... (veja logs)")
+    else:
+        print(f" Endpoint NGROK: desativado (BRN_NGROK=0)")
+    print("=" * 72)
 
 
 # =====================================================================
-# Identidade
+# CLI
 # =====================================================================
-def load_identity():
-    """Carrega ou gera identidade do nó."""
-    if WalletManager is None:
-        raise RuntimeError("cripto_wallet nao disponivel.")
+COMMANDS_HELP = """
+Comandos:
 
-    if hasattr(WalletManager, "load_node_identity"):
-        return WalletManager.load_node_identity()
+  ---- mercado (MEV commit-reveal) ----
+  commit <side> <price> <amount>         cria commit (auto-reveal)
+  reveal <hash> <salt> <side> <p> <amt>  reveal manual
+  commits                                meus commits
+  place  <side> <price> <amount>         ordem direta (SEM MEV)
+  cancel <order_id>                      cancela ordem
+  book [depth]                           order book
+  orders                                 minhas ordens abertas
+  trades                                 meus trades
 
-    sk = os.environ.get("BRN_NODE_SK")
-    pk = os.environ.get("BRN_NODE_PK")
-    if not sk or not pk:
-        if hasattr(WalletManager, "generate_keypair"):
-            sk, pk = WalletManager.generate_keypair()
-            print("[main] identidade nova gerada (guarde as chaves!)")
-        else:
-            raise RuntimeError("WalletManager sem generate_keypair.")
-    addr = WalletManager.address_from_public_key(pk)
-    return {"address": addr, "public_key": pk, "spend_secret_key": sk}
+  ---- carteira ----
+  portfolio                              saldos
+  height                                 altura atual
+
+  ---- rede ----
+  ngrok                                  endpoint NGROK
+  peers                                  peers conectados
+
+  ---- diversos ----
+  help | quit
+"""
 
 
-# =====================================================================
-# Loops
-# =====================================================================
-async def mining_loop(chain: Blockchain, pm: PeerManager, stop: asyncio.Event):
-    if not MINER_ENABLED:
-        print("[miner] mineracao desativada (BRN_MINE=0)")
-        return
-    loop = asyncio.get_event_loop()
-    while not stop.is_set():
-        block = await loop.run_in_executor(None, chain.produce_block)
-        if block is None:
-            await asyncio.sleep(1)
-            continue
+def cli_loop(node: Node):
+    chain = node.chain
+    identity = node.identity
+
+    print(COMMANDS_HELP)
+
+    while node.running:
         try:
-            await pm.broadcast({
-                "type": "inv_block",
-                "height": block.index,
-                "hash": block.hash,
-            })
-        except Exception as e:
-            print(f"[main] broadcast falhou: {e}")
-        await asyncio.sleep(MINER_INTERVAL)
-
-
-async def status_loop(chain: Blockchain, stop: asyncio.Event):
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=STATUS_INTERVAL)
-            break
-        except asyncio.TimeoutError:
-            pass
-        try:
-            h = chain.height
-            fh = chain.finality.finalized_height
-            mp = len(chain.pending)
-            pools = list(chain.state.pools.keys())
-            pool_info = ""
-            if pools:
-                pid = pools[0]
-                p = chain.state.pools[pid]
-                pool_info = (f" | pool {pid}: "
-                             f"{p['reserve_a']:.2f}/{p['reserve_b']:.2f}")
-            print(f"[status] altura={h} final={fh} mempool={mp}{pool_info}")
-        except Exception as e:
-            print(f"[status] erro: {e}")
-
-
-# =====================================================================
-# AMM — helpers de alto nível (para CLI / demo)
-# =====================================================================
-def create_pool(chain, identity, asset_a, amount_a, asset_b, amount_b,
-                fee_bps=30):
-    addr = identity["address"]
-    tx = Transaction.build(
-        tx_type="pool_create",
-        asset_id=asset_a,
-        sender_address=addr,
-        receiver_address=addr,
-        amount=amount_a,
-        nonce=chain.state.nonce(addr),
-        private_key_hex=identity["spend_secret_key"],
-        public_key_hex=identity["public_key"],
-        metadata={"asset_b": asset_b, "amount_b": amount_b, "fee_bps": fee_bps},
-    )
-    return chain.add_transaction(tx)
-
-
-def add_liquidity(chain, identity, asset_a, amount_a, asset_b, amount_b,
-                  min_lp=0.0):
-    addr = identity["address"]
-    tx = Transaction.build(
-        tx_type="liquidity_add",
-        asset_id=asset_a,
-        sender_address=addr,
-        receiver_address=addr,
-        amount=amount_a,
-        nonce=chain.state.nonce(addr),
-        private_key_hex=identity["spend_secret_key"],
-        public_key_hex=identity["public_key"],
-        metadata={"asset_b": asset_b, "amount_b": amount_b, "min_lp": min_lp},
-    )
-    return chain.add_transaction(tx)
-
-
-def remove_liquidity(chain, identity, pool_id, lp_amount, min_a=0.0, min_b=0.0):
-    addr = identity["address"]
-    tx = Transaction.build(
-        tx_type="liquidity_remove",
-        asset_id=f"LP-{pool_id}",
-        sender_address=addr,
-        receiver_address=addr,
-        amount=lp_amount,
-        nonce=chain.state.nonce(addr),
-        private_key_hex=identity["spend_secret_key"],
-        public_key_hex=identity["public_key"],
-        metadata={"min_a": min_a, "min_b": min_b},
-    )
-    return chain.add_transaction(tx)
-
-
-def swap(chain, identity, asset_in, amount_in, asset_out, min_out=0.0):
-    addr = identity["address"]
-    tx = Transaction.build(
-        tx_type="swap",
-        asset_id=asset_in,
-        sender_address=addr,
-        receiver_address=addr,
-        amount=amount_in,
-        nonce=chain.state.nonce(addr),
-        private_key_hex=identity["spend_secret_key"],
-        public_key_hex=identity["public_key"],
-        metadata={"asset_out": asset_out, "min_out": min_out},
-    )
-    return chain.add_transaction(tx)
-
-
-def print_pools(chain):
-    pools = chain.list_pools()
-    if not pools:
-        print("[pools] nenhum pool criado.")
-        return
-    for pid, p in pools.items():
-        print(f"[pool] {pid}  "
-              f"reservas: {p['reserve_a']:.4f} {p['asset_a']} / "
-              f"{p['reserve_b']:.4f} {p['asset_b']}  "
-              f"fee: {p['fee_bps']/100:.2f}%  "
-              f"lp_supply: {p['lp_supply']:.4f}")
-
-
-def print_quote(chain, asset_in, asset_out, amount):
-    q = chain.quote_swap(asset_in, asset_out, amount)
-    if not q.get("ok"):
-        print(f"[quote] {q.get('msg')}")
-        return
-    print(f"[quote] {amount} {asset_in} → {q['amount_out']:.6f} {asset_out} "
-          f"(exec_price={q['exec_price']:.6f}, spot={q['spot_price']:.6f})")
-
-
-# =====================================================================
-# CLI interativa (opcional: BRN_INTERACTIVE=1)
-# =====================================================================
-async def interactive_loop(chain: Blockchain, identity, stop: asyncio.Event):
-    loop = asyncio.get_event_loop()
-    print("\n[cli] comandos: pools | portfolio | quote <in> <out> <amt> | "
-          "swap <in> <out> <amt> <min_out> | "
-          "addliq <a> <amt_a> <b> <amt_b> | "
-          "rmliq <pool_id> <lp_amt> | "
-          "height | slashing | finality | help | quit\n")
-
-    while not stop.is_set():
-        try:
-            line = await loop.run_in_executor(None, sys.stdin.readline)
-        except Exception:
+            line = input("brn> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
         if not line:
-            await asyncio.sleep(0.2)
             continue
-        parts = line.strip().split()
-        if not parts:
-            continue
+        parts = line.split()
         cmd = parts[0].lower()
 
         try:
             if cmd in ("quit", "exit"):
-                stop.set()
                 break
+
             elif cmd == "help":
-                print("pools | portfolio | quote <in> <out> <amt> | "
-                      "swap <in> <out> <amt> <min_out> | "
-                      "addliq <a> <amt_a> <b> <amt_b> | "
-                      "rmliq <pool_id> <lp_amt> | "
-                      "height | slashing | finality | quit")
-            elif cmd == "pools":
-                print_pools(chain)
+                print(COMMANDS_HELP)
+
+            # ------------------- CLOB + MEV -------------------
+            elif cmd == "commit" and len(parts) == 4:
+                side, price, amount = parts[1], float(parts[2]), float(parts[3])
+                r = node.commit_order(side, price, amount)
+                if r.get("ok"):
+                    print(f"[commit] ok | hash={r['commit_hash']}")
+                    print(f"  salt: {r['salt']}")
+                    print(f"  auto-reveal em ~2 blocos")
+                else:
+                    print(f"[commit] erro: {r.get('msg')}")
+
+            elif cmd == "reveal" and len(parts) == 6:
+                ch, salt, side = parts[1], parts[2], parts[3]
+                price, amount = float(parts[4]), float(parts[5])
+                r = node.reveal_order(ch, salt, side, price, amount)
+                print(f"[reveal] {r}")
+
+            elif cmd == "commits":
+                lst = node.my_commits()
+                if not lst:
+                    print("  (sem commits)")
+                for c in lst:
+                    print(f"  {c['status']:>9} | {c['side']:>4} | "
+                          f"pronto em {c['blocks_until_ready']}b | "
+                          f"expira em {c['blocks_until_expire']}b | "
+                          f"{c['commit_hash']}")
+
+            elif cmd == "place" and len(parts) == 4:
+                side, price, amount = parts[1], float(parts[2]), float(parts[3])
+                r = node.place_order(side, price, amount)
+                print(f"[place] {r}")
+
+            elif cmd == "cancel" and len(parts) == 2:
+                r = node.cancel_order(parts[1])
+                print(f"[cancel] {r}")
+
+            elif cmd == "book":
+                depth = int(parts[1]) if len(parts) > 1 else 8
+                b = node.order_book(depth=depth)
+                print(f"  --- ASKS ({QUOTE} → {BASE}) ---")
+                for a in reversed(b["asks"]):
+                    print(f"   {a['price']:>12.6f}  "
+                          f"{a['amount']:>12.4f}  {a['owner']}")
+                print(f"   mid={b['mid']:.6f}   spread={b['spread']:.6f}")
+                print(f"  --- BIDS ({QUOTE} → {BASE}) ---")
+                for x in b["bids"]:
+                    print(f"   {x['price']:>12.6f}  "
+                          f"{x['amount']:>12.4f}  {x['owner']}")
+
+            elif cmd == "orders":
+                lst = node.my_orders()
+                if not lst:
+                    print("  (sem ordens abertas)")
+                for o in lst:
+                    print(f"  {o['side']:>4} {o['price']:.6f} "
+                          f"rem={o['remaining']:.4f} "
+                          f"| {o['order_id'][:16]}... [{o['status']}]")
+
+            elif cmd == "trades":
+                lst = node.my_trades(limit=10)
+                if not lst:
+                    print("  (sem trades)")
+                for t in lst:
+                    print(f"  {t['role']:>4} {t['price']:.6f} "
+                          f"{t['amount']:.4f} = {t['cost']:.4f} {t['quote']}")
+
+            # ------------------- carteira -------------------
             elif cmd == "portfolio":
-                print(json.dumps(chain.portfolio(identity["address"]),
-                                 indent=2, default=str))
+                pf = node.portfolio()
+                print(json.dumps(pf, indent=2, default=str))
+
             elif cmd == "height":
-                print(f"[chain] altura={chain.height} tip={chain.tip_hash[:16]}")
-            elif cmd == "slashing":
-                print(json.dumps(chain.slashing_report(), indent=2, default=str))
-            elif cmd == "finality":
-                print(json.dumps(chain.finality_report(), indent=2, default=str))
-            elif cmd == "quote" and len(parts) == 4:
-                print_quote(chain, parts[1], parts[2], float(parts[3]))
-            elif cmd == "swap" and len(parts) == 5:
-                r = swap(chain, identity, parts[1], float(parts[3]),
-                         parts[2], float(parts[4]))
-                print(f"[swap] {r}")
-            elif cmd == "addliq" and len(parts) == 5:
-                r = add_liquidity(chain, identity, parts[1], float(parts[2]),
-                                  parts[3], float(parts[4]))
-                print(f"[addliq] {r}")
-            elif cmd == "rmliq" and len(parts) == 3:
-                r = remove_liquidity(chain, identity, parts[1], float(parts[2]))
-                print(f"[rmliq] {r}")
+                print(f"  altura={chain.height}  tip={chain.tip_hash[:16]}")
+
+            # ------------------- rede -------------------
+            elif cmd == "ngrok":
+                if node.public_endpoint:
+                    h, p = node.public_endpoint
+                    print(f"  NGROK ativo: {h}:{p}")
+                    print(f"  Peers devem usar: "
+                          f"BRN_HARDCODED_SEEDS={h}:{p}")
+                else:
+                    print("  NGROK inativo (BRN_NGROK=0 ou subindo)")
+
+            elif cmd == "peers":
+                if not node.pm.peers:
+                    print("  (sem peers)")
+                for k, peer in node.pm.peers.items():
+                    ago = int(time.time() - peer.last_seen)
+                    direc = "out" if peer.outbound else "in "
+                    print(f"  {direc} {k[0]}:{k[1]}  h={peer.height}  "
+                          f"last={ago}s")
+
             else:
-                print("[cli] comando desconhecido. Digite 'help'.")
+                print(f"[cli] comando desconhecido: {cmd}")
         except Exception as e:
             print(f"[cli] erro: {e}")
 
 
 # =====================================================================
-# Orquestração
+# Main
 # =====================================================================
-async def main():
-    identity = load_identity()
-    print(f"[main] endereco do no: {identity['address']}")
-    print(f"[main] porta P2P: {PORT} | mine={MINER_ENABLED} | "
-          f"interactive={INTERACTIVE}")
+def main():
+    node = Node()
+    print("[main] subindo nó...")
+    node.start()
 
-    chain = Blockchain(node_identity=identity)
-    pm = PeerManager(chain, port=PORT)
+    # espera ngrok, se ativo
+    if os.environ.get("BRN_NGROK", "0") == "1":
+        wait_ngrok(node, timeout=10.0)
 
-    stop = asyncio.Event()
-    tasks = [
-        asyncio.create_task(pm.start()),
-        asyncio.create_task(mining_loop(chain, pm, stop)),
-        asyncio.create_task(status_loop(chain, stop)),
-    ]
-    if INTERACTIVE:
-        tasks.append(asyncio.create_task(interactive_loop(chain, identity, stop)))
-
+    print_header(node)
     try:
-        await asyncio.gather(*tasks)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        cli_loop(node)
     finally:
         print("\n[main] encerrando...")
-        stop.set()
-        try:
-            await pm.stop()
-        except Exception:
-            pass
-        for t in tasks:
-            t.cancel()
+        node.stop()
+        time.sleep(0.5)
         print("[main] finalizado.")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
-        pass
+        print()
