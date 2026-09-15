@@ -1,0 +1,135 @@
+/* ==========================================================================
+   INTEGRAÇÃO COM O GERADOR AUTOMÁTICO DE CONTRATOS (ESCROW FACTORY)
+   ========================================================================== */
+
+// 1. ENDEREÇO DA FÁBRICA PUBLICADA NO REMIX
+const ESCROW_FACTORY_ADDRESS = "0x_SEU_ENDERECO_DO_ESCROW_FACTORY_GERADO_NO_REMIX";
+
+// 2. ENDEREÇOS PADRÃO DAS MOEDAS NA REDE (SUBSTITUA PELAS SUAS)
+const TOKEN_BRN_ADDRESS  = "0x_ENDERECO_DO_SEU_TOKEN_BRN";
+const TOKEN_USDT_ADDRESS = "0x_ENDERECO_DO_SEU_TOKEN_USDT";
+
+// 3. ABI DA FÁBRICA DE CONTRATOS
+const FACTORY_ABI = [
+  "function criarNovoContratoEscrow(address _tokenOferecido, address _tokenDesejado, uint256 _valorOferecido, uint256 _valorDesejado) external returns (address)",
+  "function obterContratosGerados() external view returns (address[])",
+  "event ContratoCriado(address indexed enderecoContrato, address indexed criador, address tokenOferecido, address tokenDesejado, uint256 valorOferecido, uint256 valorDesejado)"
+];
+
+// 4. ABI DO CONTRATO INDIVIDUAL GERADO (PARA EXECUTAR A TROCA DEPOIS)
+const ESCROW_INDIVIDUAL_ABI = [
+  "function executarTroca() external",
+  "function cancelar() external",
+  "function criador() view returns (address)",
+  "function valorOferecido() view returns (uint256)",
+  "function valorDesejado() view returns (uint256)",
+  "function executado() view returns (bool)",
+  "function cancelado() view returns (bool)"
+];
+
+// ==========================================================================
+// FUNÇÃO: GERAR O CONTRATO AUTOMATICAMENTE PASSANDO AS VARIÁVEIS
+// ==========================================================================
+async function gerarContratoAutomatico() {
+  if (!signer) {
+    alert("Por favor, conecte sua carteira primeiro!");
+    return;
+  }
+
+  // --- CAPTURA OS VALORES DIGITADOS NA INTERFACE DO SEU APP ---
+  const tokenOferecido = document.getElementById("tokenOferecidoSelect")?.value || TOKEN_BRN_ADDRESS;
+  const tokenDesejado  = document.getElementById("tokenDesejadoSelect")?.value || TOKEN_USDT_ADDRESS;
+  
+  const inputValorOferecido = document.getElementById("valorOferecidoInput").value; // Ex: 100 (BRN)
+  const inputValorDesejado  = document.getElementById("valorDesejadoInput").value;  // Ex: 50 (USDT)
+
+  if (!inputValorOferecido || !inputValorDesejado) {
+    alert("Preencha os valores de ambas as moedas!");
+    return;
+  }
+
+  try {
+    // --- CONVERTE OS VALORES PARA AS CASAS DECIMAIS (WEI) ---
+    // Ajuste as casas decimais se seu token tiver outro valor (BRN costuma ser 18, USDT 6)
+    const valorOferecidoWei = ethers.utils.parseUnits(inputValorOferecido, 18);
+    const valorDesejadoWei  = ethers.utils.parseUnits(inputValorDesejado, 6);
+
+    // --- INSTANCIA O CONTRATO FÁBRICA NO FRONT-END ---
+    const factoryContract = new ethers.Contract(ESCROW_FACTORY_ADDRESS, FACTORY_ABI, signer);
+
+    console.log("Enviando transação para a fábrica gerar o Smart Contract...");
+
+    // --- CHAMA A FUNÇÃO DA FÁBRICA NA BLOCKCHAIN PASSANDO AS VARIÁVEIS ---
+    const tx = await factoryContract.criarNovoContratoEscrow(
+      tokenOferecido,
+      tokenDesejado,
+      valorOferecidoWei,
+      valorDesejadoWei
+    );
+
+    console.log("Aguardando confirmação do bloco...", tx.hash);
+    const receipt = await tx.wait();
+
+    // --- EXTRAI O ENDEREÇO DO NOVO CONTRATO CRIADO DO EVENTO ---
+    let enderecoNovoContrato = null;
+    for (const log of receipt.logs) {
+      try {
+        const parsedLog = factoryContract.interface.parseLog(log);
+        if (parsedLog.name === "ContratoCriado") {
+          enderecoNovoContrato = parsedLog.args.enderecoContrato;
+          break;
+        }
+      } catch (e) {
+        // Ignora logs que não pertencem ao evento
+      }
+    }
+
+    console.log("Novo Smart Contract gerado com sucesso em:", enderecoNovoContrato);
+    alert(`Contrato criado com sucesso!\n\nEndereço na Blockchain:\n${enderecoNovoContrato}`);
+
+    // --- NOTIFICA O SERVIDOR PYTHON COM O NOVO CONTRATO GERADO ---
+    if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+      webSocket.send(JSON.stringify({
+        type: 'NEW_ORDER',
+        payload: {
+          contratoAddress: enderecoNovoContrato,
+          criador: userAddress,
+          tokenOferecido: tokenOferecido,
+          tokenDesejado: tokenDesejado,
+          valorOferecido: inputValorOferecido,
+          valorDesejado: inputValorDesejado,
+          timestamp: Date.now()
+        }
+      }));
+    }
+
+  } catch (error) {
+    console.error("Erro ao gerar o contrato na blockchain:", error);
+    alert("Falha na criação do contrato. Verifique o saldo de gás ou rejeição na carteira.");
+  }
+}
+
+// ==========================================================================
+// FUNÇÃO: COMPRADOR EXECUTA A TROCA NO CONTRATO INDIVIDUAL GERADO
+// ==========================================================================
+async function executarTrocaNoContrato(enderecoContratoIndividual) {
+  if (!signer) {
+    alert("Conecte sua carteira primeiro!");
+    return;
+  }
+
+  try {
+    const contratoEscrow = new ethers.Contract(enderecoContratoIndividual, ESCROW_INDIVIDUAL_ABI, signer);
+
+    console.log("Iniciando execução no contrato:", enderecoContratoIndividual);
+    
+    // Executa a função do contrato que faz as duas transferências automáticas
+    const tx = await contratoEscrow.executarTroca();
+    await tx.wait();
+
+    alert("Troca efetuada com sucesso no Smart Contract!");
+  } catch (error) {
+    console.error("Erro ao executar a troca:", error);
+    alert("Falha ao executar a troca. Verifique se deu a permissão (approve) do token.");
+  }
+}
